@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import logging
 import os
 import random
@@ -44,6 +45,11 @@ AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
+# Предзагрузка данных о первых N результатах поиска: пока пользователь выбирает трек,
+# проходит обязательное ожидание YouTube (available_at), и при скачивании yt-dlp не спит.
+PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "3")))
+PREFETCH_TTL = 20 * 60
+PREFETCH_CACHE: dict = {}
 TG_LIMIT = 49 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
@@ -148,7 +154,7 @@ class _StageLogger:
         log.warning("  yt-dlp: %s", str(msg)[:200])
 
 
-def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list):
+def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list, prefetched=None):
     opts = _ydl_options(workdir, use_cookies, clients)
     t0 = time.monotonic()
     marks = {}
@@ -171,7 +177,10 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
     opts["postprocessor_hooks"] = [_on_pp]
     target = query if is_url else f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(target, download=True)
+        if prefetched is not None:
+            info = ydl.process_ie_result(copy.deepcopy(prefetched), download=True)
+        else:
+            info = ydl.extract_info(target, download=True)
     end = time.monotonic()
     first = marks.get("first", t0)
     dl_done = marks.get("dl_done", first)
@@ -186,6 +195,39 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         info = entries[0] if entries else None
     files = list(workdir.glob("*.mp3"))
     return info, (files[0] if files else None)
+
+
+def _extract_only(url: str):
+    """Получить данные о видео без скачивания (ссылки на форматы остаются в info)."""
+    workdir = Path(tempfile.mkdtemp(prefix="pre_"))
+    try:
+        opts = _ydl_options(workdir, bool(COOKIES_SRC), CLIENTS)
+        opts.pop("postprocessors", None)
+        opts["skip_download"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _prefetch(urls: list):
+    loop = asyncio.get_running_loop()
+    for url in urls:
+        cached = PREFETCH_CACHE.get(url)
+        if cached and time.monotonic() - cached[0] < PREFETCH_TTL:
+            continue
+        started = time.monotonic()
+        try:
+            info = await loop.run_in_executor(None, _extract_only, url)
+        except Exception as exc:
+            log.info("Предзагрузка не удалась: %s", str(exc)[:120])
+            return  # при ошибке (бот-проверка, 429) не продолжаем
+        if info and info.get("formats"):
+            PREFETCH_CACHE[url] = (time.monotonic(), info)
+            log.info("ПРЕДЗАГРУЗКА: %s готова за %.1f с", url, time.monotonic() - started)
+    now = time.monotonic()
+    for k in [k for k, v in PREFETCH_CACHE.items() if now - v[0] > PREFETCH_TTL]:
+        PREFETCH_CACHE.pop(k, None)
 
 
 def _search_tracks(query: str):
@@ -296,6 +338,11 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         schedule_delete(ctx, result_message, 600)
+        if PREFETCH_TOP:
+            tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
+            t = asyncio.create_task(_prefetch([x["url"] for x in results[:PREFETCH_TOP]]))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
     except Exception:
         log.exception("Ошибка поиска")
         await send_generic_error(ctx, chat_id)
@@ -331,8 +378,14 @@ async def process(
                 attempt_started = time.monotonic()
                 try:
                     log.info("Попытка %d/%d: %s | %s", i, len(STRATEGIES), name, query)
+                    pre = None
+                    if i == 1 and is_url:
+                        cached = PREFETCH_CACHE.pop(query, None)
+                        if cached and time.monotonic() - cached[0] < PREFETCH_TTL:
+                            pre = cached[1]
+                            log.info("Использую предзагруженные данные (возраст %.0f с)", time.monotonic() - cached[0])
                     info, path = await loop.run_in_executor(
-                        None, _download, query, is_url, attempt_dir, use_cookies, clients
+                        None, _download, query, is_url, attempt_dir, use_cookies, clients, pre
                     )
                     if path:
                         log.info("Скачивание и конвертация завершены за %.1f с", time.monotonic() - attempt_started)
