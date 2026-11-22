@@ -3,6 +3,16 @@
 Пишешь название трека (или ссылку на YouTube) → бот присылает mp3.
 Работает в личке и в группах. Стек: Python, python-telegram-bot, yt-dlp, FFmpeg.
 
+## Локальный запуск через `.env`
+
+1. Скопируй `.env.example` в файл `.env`.
+2. Открой `.env` и укажи токен:
+   `BOT_TOKEN=твой_токен_от_BotFather`
+3. Установи зависимости: `pip install -r requirements.txt`.
+4. Запусти: `python main.py`.
+
+Приложение автоматически прочитает `.env`. Этот файл игнорируется Git и не попадёт в репозиторий. Для Railway не загружай `.env`: добавь `BOT_TOKEN` в Variables сервиса.
+
 ## 1. Токен у @BotFather
 1. В Telegram открой @BotFather → `/newbot`.
 2. Задай имя и username (оканчивается на `bot`).
