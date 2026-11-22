@@ -249,7 +249,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
         keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
         result_message = await update.effective_message.reply_text(
-            "\n".join(lines),
+            "\\n".join(lines),
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         schedule_delete(ctx, result_message, 600)
@@ -258,12 +258,11 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         await send_generic_error(ctx, chat_id)
 
 
-async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str, selection_message=None):
+async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     global _last_finish
     chat_id = update.effective_chat.id
     is_url = bool(URL_RE.fullmatch(query))
     if is_url and not YT_RE.search(query):
-        await delete_message_safely(selection_message)
         await send_generic_error(ctx, chat_id)
         return
 
@@ -287,7 +286,7 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str, se
                     if path:
                         break
                     if info is None:
-                        last_err = "ничего не найдено"
+                        last_err = "no result"
                         break
                     last_err = "track exceeds configured duration"
                     break
@@ -321,93 +320,17 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str, se
             _last_finish = time.monotonic()
 
 
-async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
-    global _last_finish
-    msg = update.effective_message
-    is_url = bool(URL_RE.fullmatch(query))
-    if is_url and not YT_RE.search(query):
-        await msg.reply_text("Поддерживаются только ссылки YouTube. Напиши название трека.")
-        return
-
-    status = await msg.reply_text("⬇️ Готовлю выбранный трек…")
-    async with DL_LOCK:
-        if _last_finish:
-            wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
-            if wait > 0:
-                await asyncio.sleep(wait)
-
-        workdir = Path(tempfile.mkdtemp(prefix="dl_"))
-        info = path = None
-        last_err = ""
-        try:
-            loop = asyncio.get_running_loop()
-            for i, (name, use_cookies, clients) in enumerate(STRATEGIES, 1):
-                try:
-                    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VOICE)
-                    log.info("Попытка %d/%d: %s | %s", i, len(STRATEGIES), name, query)
-                    info, path = await loop.run_in_executor(
-                        None, _download, query, is_url, workdir, use_cookies, clients
-                    )
-                    if path:
-                        break
-                    if info is None:
-                        last_err = "ничего не найдено"
-                        break
-                    await status.edit_text(f"⏱ Трек длиннее {MAX_DURATION // 60} мин — не скачиваю.")
-                    return
-                except Exception as e:
-                    last_err = str(e)
-                    log.warning("Стратегия «%s» не сработала: %s", name, last_err[:300])
-                    if i < len(STRATEGIES):
-                        try:
-                            await status.edit_text(f"🔄 Пробую другой способ ({i}/{len(STRATEGIES) - 1})…")
-                        except Exception:
-                            pass
-
-            if not path:
-                text = "😕 Ничего не найдено." if last_err == "ничего не найдено" else (
-                    "❌ " + friendly_error(last_err)
-                )
-                await status.edit_text(text)
-                return
-
-            if path.stat().st_size > TG_LIMIT:
-                await status.edit_text("📦 Файл больше 50 МБ — Telegram не даёт отправить.")
-                return
-
-            info = info or {}
-            await status.edit_text("📤 Отправляю…")
-            with open(path, "rb") as f:
-                await msg.reply_audio(
-                    audio=f,
-                    title=info.get("track") or info.get("title"),
-                    performer=info.get("artist") or info.get("uploader"),
-                    duration=int(info.get("duration") or 0) or None,
-                    filename=f"{(info.get('title') or 'track')[:60]}.mp3",
-                    read_timeout=180,
-                    write_timeout=180,
-                )
-            await status.delete()
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-            _last_finish = time.monotonic()
-
-
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    callback = update.callback_query
+    await callback.answer()
     data = ctx.user_data.get("music_search") or {}
     try:
-        _, token, raw_index = query.data.split(":")
+        _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
-        if (
-            token != data.get("token")
-            or time.time() - data.get("created", 0) > 600
-            or ctx.user_data.get("music_processing_token") == token
-        ):
-            if token != ctx.user_data.get("music_processing_token"):
-                await delete_message_safely(query.message)
-                await send_generic_error(ctx, update.effective_chat.id)
+        if token != data.get("token") or time.time() - data.get("created", 0) > 600:
+            await send_generic_error(ctx, update.effective_chat.id)
+            return
+        if ctx.user_data.get("music_processing_token") == token:
             return
 
         results = data.get("results") or []
@@ -418,12 +341,11 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         selected = results[index]
         ctx.user_data["music_processing_token"] = token
         try:
-            await process(update, ctx, selected["url"], selection_message=query.message)
+            await process(update, ctx, selected["url"])
         finally:
             if ctx.user_data.get("music_processing_token") == token:
                 ctx.user_data.pop("music_processing_token", None)
     except (ValueError, AttributeError):
-        await delete_message_safely(query.message)
         await send_generic_error(ctx, update.effective_chat.id)
 
 
