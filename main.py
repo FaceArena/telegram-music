@@ -129,9 +129,36 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
 
 def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list):
     opts = _ydl_options(workdir, use_cookies, clients)
+    t0 = time.monotonic()
+    marks = {}
+
+    def _on_progress(d):
+        st = d.get("status")
+        if st == "downloading" and "first" not in marks:
+            marks["first"] = time.monotonic()
+        elif st == "finished":
+            marks["dl_done"] = time.monotonic()
+
+    def _on_pp(d):
+        if d.get("status") == "started":
+            marks["pp_start"] = time.monotonic()
+        elif d.get("status") == "finished":
+            marks["pp_done"] = time.monotonic()
+
+    opts["progress_hooks"] = [_on_progress]
+    opts["postprocessor_hooks"] = [_on_pp]
     target = query if is_url else f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=True)
+    end = time.monotonic()
+    first = marks.get("first", t0)
+    dl_done = marks.get("dl_done", first)
+    pp_start = marks.get("pp_start", dl_done)
+    pp_done = marks.get("pp_done", end)
+    log.info(
+        "ТАЙМИНГ: извлечение данных %.1f с | загрузка %.1f с | ffmpeg %.1f с | всего %.1f с",
+        first - t0, dl_done - first, pp_done - pp_start, end - t0,
+    )
     if info and "entries" in info:
         entries = [e for e in info["entries"] if e]
         info = entries[0] if entries else None
@@ -221,7 +248,9 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
     try:
         async with SEARCH_SEMAPHORE:
             loop = asyncio.get_running_loop()
+            search_started = time.monotonic()
             results = await loop.run_in_executor(None, _search_tracks, query)
+            log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
         if not results:
             await send_generic_error(ctx, chat_id)
             return
