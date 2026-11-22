@@ -196,9 +196,13 @@ def schedule_delete(ctx: ContextTypes.DEFAULT_TYPE, message, delay: int):
     task.add_done_callback(tasks.discard)
 
 
-async def send_generic_error(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def send_generic_error(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str = "Произошла ошибка.",
+):
     try:
-        message = await ctx.bot.send_message(chat_id=chat_id, text="Произошла ошибка.")
+        message = await ctx.bot.send_message(chat_id=chat_id, text=text)
         schedule_delete(ctx, message, 15)
     except Exception:
         log.exception("Не удалось отправить сообщение об ошибке")
@@ -238,12 +242,17 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         await send_generic_error(ctx, chat_id)
 
 
-async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
+async def process(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    error_text: str = "Произошла ошибка.",
+):
     global _last_finish
     chat_id = update.effective_chat.id
     is_url = bool(URL_RE.fullmatch(query))
     if is_url and not YT_RE.search(query):
-        await send_generic_error(ctx, chat_id)
+        await send_generic_error(ctx, chat_id, error_text)
         return
 
     async with DL_LOCK:
@@ -302,30 +311,42 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
 
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
-    await callback.answer()
     data = ctx.user_data.get("music_search") or {}
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
         if token != data.get("token") or time.time() - data.get("created", 0) > 600:
+            await callback.answer()
             await send_generic_error(ctx, update.effective_chat.id)
             return
         if ctx.user_data.get("music_processing_token") == token:
+            await callback.answer()
             return
 
         results = data.get("results") or []
         if index < 0 or index >= len(results):
+            await callback.answer()
             await send_generic_error(ctx, update.effective_chat.id)
             return
 
         selected = results[index]
         ctx.user_data["music_processing_token"] = token
+        await callback.answer("Загружаю…")
         try:
-            await process(update, ctx, selected["url"])
+            await process(
+                update,
+                ctx,
+                selected["url"],
+                error_text="Не удалось загрузить.",
+            )
         finally:
             if ctx.user_data.get("music_processing_token") == token:
                 ctx.user_data.pop("music_processing_token", None)
     except (ValueError, AttributeError):
+        try:
+            await callback.answer()
+        except Exception:
+            pass
         await send_generic_error(ctx, update.effective_chat.id)
 
 
