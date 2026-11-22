@@ -11,6 +11,8 @@
 3. Установи зависимости: `pip install -r requirements.txt`.
 4. Запусти: `python main.py`.
 
+Для запуска в Docker: скопируй `.env.example` в `.env`, заполни `BOT_TOKEN` и выполни `docker compose up --build -d`. Остановка: `docker compose down`.
+
 Приложение автоматически прочитает `.env`. Этот файл игнорируется Git и не попадёт в репозиторий. Для Railway не загружай `.env`: добавь `BOT_TOKEN` в Variables сервиса.
 
 ## 1. Токен у @BotFather
