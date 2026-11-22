@@ -44,7 +44,6 @@ AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
-SKIP_AD_WAIT = os.getenv("SKIP_AD_WAIT", "1") == "1"
 TG_LIMIT = 49 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
@@ -128,16 +127,6 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     return opts
 
 
-class _SkipAdWait(yt_dlp.postprocessor.PostProcessor):
-    """YouTube отдаёт метку available_at (ожидание «пропускаемой рекламы», ~5 с),
-    и yt-dlp спит перед загрузкой. Для аудио это ожидание не нужно — убираем."""
-
-    def run(self, info):
-        for f in [info, *(info.get("requested_formats") or [])]:
-            f.pop("available_at", None)
-        return [], info
-
-
 class _StageLogger:
     """Пишет этапы yt-dlp с временем от начала — видно, где именно тратятся секунды."""
 
@@ -182,8 +171,6 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
     opts["postprocessor_hooks"] = [_on_pp]
     target = query if is_url else f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(opts) as ydl:
-        if SKIP_AD_WAIT:
-            ydl.add_post_processor(_SkipAdWait(ydl), when="before_dl")
         info = ydl.extract_info(target, download=True)
     end = time.monotonic()
     first = marks.get("first", t0)
