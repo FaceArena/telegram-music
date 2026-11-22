@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+cookies.txt
+__pycache__/
+*.py[cod]
+*.mp3
