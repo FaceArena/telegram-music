@@ -229,7 +229,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
         keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
         result_message = await update.effective_message.reply_text(
-            "\\n".join(lines),
+            "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         schedule_delete(ctx, result_message, 600)
