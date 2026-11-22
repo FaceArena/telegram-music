@@ -20,6 +20,7 @@ load_dotenv()
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -446,6 +447,43 @@ async def process(
             _last_finish = time.monotonic()
 
 
+SPINNER = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
+ANIM_INTERVAL = 1.2
+
+
+async def _animate_picker(message, index: int):
+    """Крутит часы на нажатой кнопке и «Загружаю…» в заголовке, пока идёт загрузка/отправка."""
+    text = message.text or ""
+    markup = message.reply_markup
+    if not text or not markup:
+        return
+    lines = text.split("\n")
+    step = 0
+    while True:
+        step += 1
+        frame = SPINNER[step % len(SPINNER)]
+        new_lines = lines[:]
+        new_lines[0] = f"{frame} Загружаю{'.' * (step % 4)}"
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    frame if r * 5 + c == index else b.text,
+                    callback_data=b.callback_data,
+                )
+                for c, b in enumerate(row)
+            ]
+            for r, row in enumerate(markup.inline_keyboard)
+        ]
+        try:
+            await message.edit_text("\n".join(new_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            continue
+        except Exception as exc:
+            log.debug("Анимация: %s", exc)
+        await asyncio.sleep(ANIM_INTERVAL)
+
+
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
     data = ctx.user_data.get("music_search") or {}
@@ -469,6 +507,8 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         selected = results[index]
         await callback.answer("Загружаю…")
         ctx.user_data["music_processing_token"] = token
+        picker = callback.message
+        anim = asyncio.create_task(_animate_picker(picker, index)) if picker else None
         try:
             await process(
                 update,
@@ -477,6 +517,16 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 error_text="Не удалось загрузить.",
             )
         finally:
+            if anim:
+                anim.cancel()
+                try:
+                    await anim
+                except (asyncio.CancelledError, Exception):
+                    pass
+                try:  # вернуть окно выбора в исходный вид
+                    await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
+                except Exception as exc:
+                    log.debug("Не удалось восстановить окно выбора: %s", exc)
             if ctx.user_data.get("music_processing_token") == token:
                 ctx.user_data.pop("music_processing_token", None)
     except (ValueError, AttributeError):
