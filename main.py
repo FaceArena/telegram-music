@@ -38,19 +38,21 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))
 # Small configurable cooldown; no multi-second artificial wait by default.
-MIN_DELAY = max(0.0, float(os.getenv("MIN_DELAY", "0.5")))
-MAX_DELAY = max(MIN_DELAY, float(os.getenv("MAX_DELAY", "1.0")))
+MIN_DELAY = max(0.0, float(os.getenv("MIN_DELAY", "0")))
+MAX_DELAY = max(MIN_DELAY, float(os.getenv("MAX_DELAY", "0")))
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 TG_LIMIT = 49 * 1024 * 1024
 
-CLIENTS = ["tv", "web_embedded", "web"]
+# web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
+CLIENTS = ["tv", "web_embedded"]
 URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
-DL_LOCK = asyncio.Lock()
+MAX_PARALLEL_DL = max(1, int(os.getenv("MAX_PARALLEL_DL", "3")))
+DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
 SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 _last_finish = 0.0
 
@@ -82,15 +84,13 @@ def build_strategies():
     # can multiply one failed download into several long network timeouts.
     if COOKIES_SRC:
         return [
-            ("cookies + tv/web_embedded/web", True, CLIENTS),
+            ("cookies + tv/web_embedded", True, CLIENTS),
             ("cookies + web", True, ["web"]),
             ("без cookies + web", False, ["web"]),
-            ("без cookies + tv/web_embedded", False, ["tv", "web_embedded"]),
         ]
     return [
-        ("tv/web_embedded/web", False, CLIENTS),
+        ("tv/web_embedded", False, CLIENTS),
         ("web", False, ["web"]),
-        ("tv/web_embedded", False, ["tv", "web_embedded"]),
     ]
 
 
@@ -99,7 +99,7 @@ STRATEGIES = build_strategies()
 
 def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -117,7 +117,6 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
         }],
         "extractor_args": {"youtube": {"player_client": clients}},
         "js_runtimes": {"deno": {}},
-        "remote_components": ["ejs:github"],
     }
     if POT_PROVIDER_URL:
         opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
