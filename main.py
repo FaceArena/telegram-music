@@ -317,7 +317,6 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str, se
             log.exception("Не удалось обработать или отправить трек")
             await send_generic_error(ctx, chat_id)
         finally:
-            await delete_message_safely(selection_message)
             shutil.rmtree(workdir, ignore_errors=True)
             _last_finish = time.monotonic()
 
@@ -413,13 +412,11 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         results = data.get("results") or []
         if index < 0 or index >= len(results):
-            await delete_message_safely(query.message)
             await send_generic_error(ctx, update.effective_chat.id)
             return
 
         selected = results[index]
         ctx.user_data["music_processing_token"] = token
-        await query.edit_message_reply_markup(reply_markup=None)
         try:
             await process(update, ctx, selected["url"], selection_message=query.message)
         finally:
