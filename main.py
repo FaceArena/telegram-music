@@ -11,6 +11,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import yt_dlp
 from telegram import Update
 from telegram.constants import ChatAction
