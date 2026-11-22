@@ -47,7 +47,7 @@ UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 TG_LIMIT = 49 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
-CLIENTS = ["tv", "web_embedded"]
+CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
@@ -127,6 +127,27 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     return opts
 
 
+class _StageLogger:
+    """Пишет этапы yt-dlp с временем от начала — видно, где именно тратятся секунды."""
+
+    def __init__(self):
+        self.t0 = time.monotonic()
+
+    def debug(self, msg):
+        if msg.startswith("[debug]"):
+            return
+        log.info("  yt-dlp +%.1f с: %s", time.monotonic() - self.t0, str(msg)[:140])
+
+    def info(self, msg):
+        self.debug(msg)
+
+    def warning(self, msg):
+        log.warning("  yt-dlp: %s", str(msg)[:200])
+
+    def error(self, msg):
+        log.warning("  yt-dlp: %s", str(msg)[:200])
+
+
 def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list):
     opts = _ydl_options(workdir, use_cookies, clients)
     t0 = time.monotonic()
@@ -145,6 +166,7 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         elif d.get("status") == "finished":
             marks["pp_done"] = time.monotonic()
 
+    opts["logger"] = _StageLogger()
     opts["progress_hooks"] = [_on_progress]
     opts["postprocessor_hooks"] = [_on_pp]
     target = query if is_url else f"ytsearch1:{query}"
