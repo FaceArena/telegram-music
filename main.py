@@ -5,10 +5,13 @@ import logging
 import os
 import random
 import re
+import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import secrets
 from pathlib import Path
@@ -48,7 +51,7 @@ POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 # Предзагрузка данных о первых N результатах поиска: пока пользователь выбирает трек,
 # проходит обязательное ожидание YouTube (available_at), и при скачивании yt-dlp не спит.
-PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "3")))
+PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "1")))
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
 MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
@@ -90,6 +93,95 @@ def load_cookies() -> Path | None:
 
 
 COOKIES_SRC = load_cookies()
+
+
+# ───────────────────────── Кэш ─────────────────────────
+# 1) file_id Telegram по id видео: повторный запрос отправляется мгновенно, без YouTube и ffmpeg.
+# 2) результаты поиска по тексту запроса на SEARCH_CACHE_TTL секунд.
+# БД лежит в CACHE_DIR (по умолчанию /data, если есть том; иначе временная папка — тогда
+# кэш сбрасывается при деплое).
+SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", str(6 * 3600)))
+VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
+
+
+def _cache_path() -> Path:
+    for cand in (os.getenv("CACHE_DIR", "").strip(), "/data", tempfile.gettempdir()):
+        if cand and Path(cand).is_dir() and os.access(cand, os.W_OK):
+            return Path(cand) / "musicbot_cache.db"
+    return Path(tempfile.gettempdir()) / "musicbot_cache.db"
+
+
+class Cache:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS tracks (key TEXT PRIMARY KEY, file_id TEXT NOT NULL, "
+            "title TEXT, performer TEXT, duration INTEGER, created REAL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS searches (q TEXT PRIMARY KEY, results TEXT NOT NULL, created REAL)"
+        )
+        self.db.commit()
+
+    @staticmethod
+    def track_key(video_id: str) -> str:
+        return f"{video_id}:{AUDIO_FORMAT}"
+
+    def get_track(self, video_id: str):
+        with self.lock:
+            return self.db.execute(
+                "SELECT file_id, title, performer, duration FROM tracks WHERE key=?",
+                (self.track_key(video_id),),
+            ).fetchone()
+
+    def put_track(self, video_id: str, file_id: str, title, performer, duration):
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO tracks VALUES (?,?,?,?,?,?)",
+                (self.track_key(video_id), file_id, title, performer, duration, time.time()),
+            )
+            self.db.commit()
+
+    def drop_track(self, video_id: str):
+        with self.lock:
+            self.db.execute("DELETE FROM tracks WHERE key=?", (self.track_key(video_id),))
+            self.db.commit()
+
+    def get_search(self, q: str):
+        with self.lock:
+            row = self.db.execute("SELECT results, created FROM searches WHERE q=?", (q,)).fetchone()
+        if row and time.time() - row[1] < SEARCH_CACHE_TTL:
+            return json.loads(row[0])
+        return None
+
+    def put_search(self, q: str, results: list):
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO searches VALUES (?,?,?)", (q, json.dumps(results), time.time())
+            )
+            self.db.execute("DELETE FROM searches WHERE created < ?", (time.time() - SEARCH_CACHE_TTL,))
+            self.db.commit()
+
+
+try:
+    CACHE = Cache(_cache_path())
+    log.info("Кэш: %s", CACHE.path)
+except Exception as _e:  # кэш — оптимизация, бот должен работать и без него
+    CACHE = None
+    log.warning("Кэш недоступен: %s", _e)
+
+
+def video_id_of(url: str):
+    m = VIDEO_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def norm_query(q: str) -> str:
+    return " ".join(q.lower().split())[:200]
 
 
 def build_strategies():
@@ -324,11 +416,18 @@ async def send_generic_error(
 async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     chat_id = update.effective_chat.id
     try:
-        async with SEARCH_SEMAPHORE:
-            loop = asyncio.get_running_loop()
-            search_started = time.monotonic()
-            results = await loop.run_in_executor(None, _search_tracks, query)
-            log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
+        nq = norm_query(query)
+        results = CACHE.get_search(nq) if CACHE else None
+        if results:
+            log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
+        else:
+            async with SEARCH_SEMAPHORE:
+                loop = asyncio.get_running_loop()
+                search_started = time.monotonic()
+                results = await loop.run_in_executor(None, _search_tracks, query)
+                log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
+            if results and CACHE:
+                CACHE.put_search(nq, results)
         if not results:
             await send_generic_error(ctx, chat_id)
             return
@@ -354,7 +453,11 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         schedule_delete(ctx, result_message, 600)
         if PREFETCH_TOP:
             tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
-            t = asyncio.create_task(_prefetch([x["url"] for x in results[:PREFETCH_TOP]]))
+            to_prefetch = [
+                x["url"] for x in results[:PREFETCH_TOP]
+                if not (CACHE and video_id_of(x["url"]) and CACHE.get_track(video_id_of(x["url"])))
+            ]
+            t = asyncio.create_task(_prefetch(to_prefetch))
             tasks.add(t)
             t.add_done_callback(tasks.discard)
     except Exception:
@@ -374,6 +477,21 @@ async def process(
     if is_url and not YT_RE.search(query):
         await send_generic_error(ctx, chat_id, error_text)
         return
+
+    vid = video_id_of(query) if is_url else None
+    if vid and CACHE:
+        row = CACHE.get_track(vid)
+        if row:
+            try:
+                await ctx.bot.send_audio(
+                    chat_id=chat_id, audio=row[0], title=row[1], performer=row[2],
+                    duration=row[3], read_timeout=60, write_timeout=60,
+                )
+                log.info("КЭШ: трек %s отправлен по file_id", vid)
+                return
+            except Exception as exc:
+                log.warning("КЭШ: file_id для %s не сработал (%s), качаю заново", vid, str(exc)[:100])
+                CACHE.drop_track(vid)
 
     async with DL_LOCK:
         if _last_finish and MAX_DELAY > 0:
@@ -425,7 +543,7 @@ async def process(
             info = info or {}
             upload_started = time.monotonic()
             with open(path, "rb") as audio_file:
-                await ctx.bot.send_audio(
+                sent = await ctx.bot.send_audio(
                     chat_id=chat_id,
                     audio=audio_file,
                     title=info.get("track") or info.get("title"),
@@ -437,7 +555,18 @@ async def process(
                     connect_timeout=30,
                     pool_timeout=30,
                 )
-            log.info("Отправка MP3 в Telegram завершена за %.1f с (%.1f МБ)",
+            try:
+                if CACHE and sent and sent.audio and (vid or info.get("id")):
+                    CACHE.put_track(
+                        vid or info.get("id") or "",
+                        sent.audio.file_id,
+                        info.get("track") or info.get("title"),
+                        info.get("artist") or info.get("uploader"),
+                        int(info.get("duration") or 0) or None,
+                    )
+            except Exception as exc:
+                log.warning("Не удалось сохранить в кэш: %s", exc)
+            log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
                      time.monotonic() - upload_started, path.stat().st_size / (1024 * 1024))
         except Exception:
             log.exception("Не удалось обработать или отправить трек")
