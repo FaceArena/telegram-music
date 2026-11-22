@@ -51,6 +51,11 @@ PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "3")))
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
 MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
+# mp3 (по умолчанию) требует перекодирования в ffmpeg — это самый долгий этап на длинных треках.
+# AUDIO_FORMAT=m4a отдаёт AAC без перекодирования (почти мгновенно); Telegram его тоже проигрывает.
+AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mp3").strip().lower()
+if AUDIO_FORMAT not in ("mp3", "m4a"):
+    AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
@@ -122,9 +127,11 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
         "match_filter": match_filter_func(f"duration < {MAX_DURATION}"),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
+            "preferredcodec": AUDIO_FORMAT,
             "preferredquality": AUDIO_QUALITY,
         }],
+        # compression_level 9 — быстрее кодирует mp3 (≈на 40%) при том же качестве
+        "postprocessor_args": {"extractaudio": ["-compression_level", "9"]} if AUDIO_FORMAT == "mp3" else {},
         "extractor_args": {"youtube": {"player_client": clients}},
         "js_runtimes": {"deno": {}},
     }
@@ -199,7 +206,7 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
     if info and "entries" in info:
         entries = [e for e in info["entries"] if e]
         info = entries[0] if entries else None
-    files = list(workdir.glob("*.mp3"))
+    files = list(workdir.glob(f"*.{AUDIO_FORMAT}"))
     return info, (files[0] if files else None)
 
 
@@ -423,7 +430,7 @@ async def process(
                     title=info.get("track") or info.get("title"),
                     performer=info.get("artist") or info.get("uploader"),
                     duration=int(info.get("duration") or 0) or None,
-                    filename=f"{(info.get('title') or 'track')[:60]}.mp3",
+                    filename=f"{(info.get('title') or 'track')[:60]}.{AUDIO_FORMAT}",
                     read_timeout=180,
                     write_timeout=180,
                     connect_timeout=30,
