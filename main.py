@@ -46,8 +46,8 @@ UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 TG_LIMIT = 49 * 1024 * 1024
 
 CLIENTS = ["tv", "web_embedded", "web"]
-URL_RE = re.compile(r"https?://\\S+")
-YT_RE = re.compile(r"(youtube\\.com|youtu\\.be|music\\.youtube\\.com)", re.I)
+URL_RE = re.compile(r"https?://\S+")
+YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
 DL_LOCK = asyncio.Lock()
 SEARCH_LOCK = asyncio.Lock()
