@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import secrets
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,10 +17,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import yt_dlp
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -34,25 +36,25 @@ log = logging.getLogger("musicbot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))  # секунд
-MIN_DELAY = float(os.getenv("MIN_DELAY", "5"))
-MAX_DELAY = float(os.getenv("MAX_DELAY", "10"))
-AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")  # kbps
+MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))
+MIN_DELAY = float(os.getenv("MIN_DELAY", "2"))
+MAX_DELAY = float(os.getenv("MAX_DELAY", "4"))
+AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 TG_LIMIT = 49 * 1024 * 1024
 
-CLIENTS = ["tv", "web_embedded", "web"]  # android намеренно не используется
+CLIENTS = ["tv", "web_embedded", "web"]
 URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
 DL_LOCK = asyncio.Lock()
+SEARCH_LOCK = asyncio.Lock()
 _last_finish = 0.0
 
 
 def load_cookies() -> Path | None:
-    """Стратегия A: cookies из YOUTUBE_COOKIES_B64 или файла YOUTUBE_COOKIES_FILE."""
     dest = Path(tempfile.gettempdir()) / "yt_cookies_src.txt"
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     path = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
@@ -75,8 +77,6 @@ COOKIES_SRC = load_cookies()
 
 
 def build_strategies():
-    """Каскад: A (cookies) + B (player_client) ; C (PO token) подключается автоматически,
-    если задан POT_PROVIDER_URL."""
     s = []
     if COOKIES_SRC:
         s.append(("cookies + tv/web_embedded/web", True, CLIENTS))
@@ -91,7 +91,7 @@ def build_strategies():
 STRATEGIES = build_strategies()
 
 
-def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list):
+def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     opts = {
         "format": "bestaudio/best",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
@@ -101,15 +101,12 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         "retries": 2,
         "socket_timeout": 30,
         "match_filter": match_filter_func(f"duration < {MAX_DURATION}"),
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": AUDIO_QUALITY,
-            }
-        ],
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": AUDIO_QUALITY,
+        }],
         "extractor_args": {"youtube": {"player_client": clients}},
-        # JS-рантайм нужен новым версиям yt-dlp для расшифровки ссылок
         "js_runtimes": {"deno": {}},
         "remote_components": ["ejs:github"],
     }
@@ -119,7 +116,11 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         cj = workdir / "cookies.txt"
         shutil.copy(COOKIES_SRC, cj)
         opts["cookiefile"] = str(cj)
+    return opts
 
+
+def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, clients: list):
+    opts = _ydl_options(workdir, use_cookies, clients)
     target = query if is_url else f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=True)
@@ -128,6 +129,54 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         info = entries[0] if entries else None
     files = list(workdir.glob("*.mp3"))
     return info, (files[0] if files else None)
+
+
+def _search_tracks(query: str):
+    """Получить до 10 результатов поиска без скачивания аудио."""
+    workdir = Path(tempfile.mkdtemp(prefix="search_"))
+    try:
+        last_error = None
+        for use_cookies, clients in (
+            (True, CLIENTS) if COOKIES_SRC else (False, CLIENTS),
+            (False, ["web"]),
+        ):
+            try:
+                opts = _ydl_options(workdir, use_cookies, clients)
+                opts.pop("format", None)
+                opts.pop("postprocessors", None)
+                opts.pop("match_filter", None)
+                opts["extract_flat"] = "in_playlist"
+                opts["skip_download"] = True
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    data = ydl.extract_info(f"ytsearch10:{query}", download=False)
+                entries = (data or {}).get("entries") or []
+                results = []
+                for entry in entries:
+                    if not entry:
+                        continue
+                    duration = entry.get("duration")
+                    if duration and duration > MAX_DURATION:
+                        continue
+                    video_id = entry.get("id")
+                    url = entry.get("url") or entry.get("webpage_url")
+                    if not url or not str(url).startswith("http"):
+                        if not video_id:
+                            continue
+                        url = f"https://www.youtube.com/watch?v={video_id}"
+                    results.append({
+                        "title": entry.get("title") or "Без названия",
+                        "url": url,
+                        "duration": duration,
+                    })
+                return results[:10]
+            except Exception as exc:
+                last_error = exc
+                log.warning("Поиск не сработал для клиента %s: %s", clients, str(exc)[:250])
+        if last_error:
+            raise last_error
+        return []
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def friendly_error(err: str) -> str:
@@ -141,6 +190,40 @@ def friendly_error(err: str) -> str:
     return "Не удалось скачать трек."
 
 
+async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
+    msg = update.effective_message
+    status = await msg.reply_text("🔎 Ищу до 10 вариантов…")
+    try:
+        async with SEARCH_LOCK:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, _search_tracks, query)
+        if not results:
+            await status.edit_text("😕 Ничего не найдено. Попробуй другое название.")
+            return
+        token = secrets.token_hex(4)
+        ctx.user_data["music_search"] = {
+            "token": token,
+            "results": results,
+            "created": time.time(),
+        }
+        lines = ["🎵 **Нашёл варианты. Выбери номер:**"]
+        buttons = []
+        for i, item in enumerate(results, 1):
+            duration = item.get("duration")
+            time_label = f" · {int(duration // 60)}:{int(duration % 60):02d}" if duration else ""
+            lines.append(f"{i}. {item['title']}{time_label}")
+            buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
+        keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+        await status.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        log.exception("Ошибка поиска")
+        await status.edit_text("❌ Не удалось выполнить поиск. Попробуй ещё раз.")
+
+
 async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     global _last_finish
     msg = update.effective_message
@@ -149,9 +232,8 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
         await msg.reply_text("Поддерживаются только ссылки YouTube. Напиши название трека.")
         return
 
-    status = await msg.reply_text("🔎 Ищу…")
+    status = await msg.reply_text("⬇️ Готовлю выбранный трек…")
     async with DL_LOCK:
-        # пауза между скачиваниями — чтобы не провоцировать блокировку
         if _last_finish:
             wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
             if wait > 0:
@@ -174,12 +256,9 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
                     if info is None:
                         last_err = "ничего не найдено"
                         break
-                    # info есть, файла нет — отфильтровано по длительности
-                    await status.edit_text(
-                        f"⏱ Трек длиннее {MAX_DURATION // 60} мин — не скачиваю."
-                    )
+                    await status.edit_text(f"⏱ Трек длиннее {MAX_DURATION // 60} мин — не скачиваю.")
                     return
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     last_err = str(e)
                     log.warning("Стратегия «%s» не сработала: %s", name, last_err[:300])
                     if i < len(STRATEGIES):
@@ -199,8 +278,7 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
                 await status.edit_text("📦 Файл больше 50 МБ — Telegram не даёт отправить.")
                 return
 
-            if not info:
-                info = {}
+            info = info or {}
             await status.edit_text("📤 Отправляю…")
             with open(path, "rb") as f:
                 await msg.reply_audio(
@@ -218,11 +296,32 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
             _last_finish = time.monotonic()
 
 
+async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = ctx.user_data.get("music_search") or {}
+    try:
+        _, token, raw_index = query.data.split(":")
+        index = int(raw_index)
+        if token != data.get("token") or time.time() - data.get("created", 0) > 900:
+            await query.message.reply_text("⌛ Этот список устарел. Напиши запрос ещё раз.")
+            return
+        results = data.get("results") or []
+        if index < 0 or index >= len(results):
+            await query.message.reply_text("Не удалось найти выбранный вариант. Повтори поиск.")
+            return
+        selected = results[index]
+        await query.edit_message_text(f"Выбрано: {selected['title']}")
+        await process(update, ctx, selected["url"])
+    except (ValueError, AttributeError):
+        await query.message.reply_text("Не удалось обработать выбор. Повтори поиск.")
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Привет! Напиши название трека (например, «Кино — Группа крови») "
-        "или пришли ссылку на YouTube — я отправлю mp3.\n"
-        "В группах можно также: /music название"
+        "Привет! Напиши название трека — покажу до 10 вариантов. "
+        "Выбери номер, и я отправлю mp3.\n"
+        "Также можно прислать ссылку на YouTube. В группах: /music название"
     )
 
 
@@ -231,7 +330,10 @@ async def cmd_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not query:
         await update.effective_message.reply_text("Напиши так: /music Кино — Группа крови")
         return
-    await process(update, ctx, query[:200])
+    if URL_RE.fullmatch(query):
+        await process(update, ctx, query[:500])
+    else:
+        await show_search(update, ctx, query[:200])
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -246,14 +348,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not GROUP_REACT_ALL and not mentioned:
             return
         text = re.sub(re.escape(uname), "", text, flags=re.I).strip()
-        # в группах не реагируем на длинные «разговорные» сообщения
         if not text or len(text) > 120 or text.count("\n") > 1:
             return
-    await process(update, ctx, text[:200])
+    if URL_RE.fullmatch(text):
+        await process(update, ctx, text[:500])
+    else:
+        await show_search(update, ctx, text[:200])
 
 
 async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
-    """Регулярное обновление yt-dlp; при новой версии — перезапуск процесса."""
     before = yt_dlp.version.__version__
     try:
         subprocess.run(
@@ -267,7 +370,7 @@ async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
         if out and out != before:
             log.info("yt-dlp обновлён %s → %s, перезапуск", before, out)
             os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("Не удалось обновить yt-dlp: %s", e)
 
 
@@ -276,6 +379,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("music", cmd_music))
+    app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
         app.job_queue.run_repeating(
