@@ -1,4 +1,4 @@
 #!/bin/sh
-# Обновляем yt-dlp при каждом запуске (YouTube часто меняет защиту)
-pip install -U --no-cache-dir "yt-dlp[default]" bgutil-ytdlp-pot-provider || echo "update skipped"
+# Все зависимости устанавливаются на этапе сборки Docker-образа.
+# Не обновляем их при каждом старте: это замедляет перезапуск и делает запуск непредсказуемым.
 exec python main.py
