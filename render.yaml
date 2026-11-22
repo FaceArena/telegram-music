@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: music-telegram-bot
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: YOUTUBE_COOKIES_B64
+        sync: false
+      - key: POT_PROVIDER_URL
+        sync: false
