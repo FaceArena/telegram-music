@@ -50,6 +50,7 @@ UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
 PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "3")))
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
+MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
 TG_LIMIT = 49 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
@@ -88,13 +89,16 @@ COOKIES_SRC = load_cookies()
 def build_strategies():
     # Keep a small, purposeful fallback chain. Trying every client separately
     # can multiply one failed download into several long network timeouts.
+    # mweb + use_ad_playback_context пропускает рекламу и обязательное ожидание перед загрузкой.
+    # Не использовать с cookies Premium-аккаунта (теряются premium-форматы): MWEB_FIRST=0.
+    fast = [("mweb без ожидания рекламы", bool(COOKIES_SRC), ["mweb"])] if MWEB_FIRST else []
     if COOKIES_SRC:
-        return [
+        return fast + [
             ("cookies + tv/web_embedded", True, CLIENTS),
             ("cookies + web", True, ["web"]),
             ("без cookies + web", False, ["web"]),
         ]
-    return [
+    return fast + [
         ("tv/web_embedded", False, CLIENTS),
         ("web", False, ["web"]),
     ]
@@ -124,6 +128,8 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
         "extractor_args": {"youtube": {"player_client": clients}},
         "js_runtimes": {"deno": {}},
     }
+    if clients == ["mweb"]:
+        opts["extractor_args"]["youtube"]["use_ad_playback_context"] = ["true"]
     if POT_PROVIDER_URL:
         opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
     if use_cookies and COOKIES_SRC:
