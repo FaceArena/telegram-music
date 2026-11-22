@@ -179,17 +179,6 @@ def _search_tracks(query: str):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def friendly_error(err: str) -> str:
-    e = err.lower()
-    if "sign in to confirm" in e or "not a bot" in e:
-        return "YouTube заблокировал запрос с IP сервера. Нужны свежие cookies (см. README)."
-    if "403" in e:
-        return "YouTube вернул 403 (доступ запрещён)."
-    if "private" in e or "unavailable" in e:
-        return "Видео недоступно (приватное или удалено)."
-    return "Не удалось скачать трек."
-
-
 async def _delete_message_later(bot, chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
     try:
