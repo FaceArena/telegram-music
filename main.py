@@ -204,15 +204,6 @@ async def send_generic_error(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
         log.exception("Не удалось отправить сообщение об ошибке")
 
 
-async def delete_message_safely(message):
-    if message is None:
-        return
-    try:
-        await message.delete()
-    except Exception as exc:
-        log.debug("Не удалось удалить сообщение %s: %s", getattr(message, "message_id", "?"), exc)
-
-
 async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     chat_id = update.effective_chat.id
     try:
