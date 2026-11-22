@@ -190,23 +190,57 @@ def friendly_error(err: str) -> str:
     return "Не удалось скачать трек."
 
 
+async def _delete_message_later(bot, chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        log.debug("Не удалось удалить временное сообщение %s: %s", message_id, exc)
+
+
+def schedule_delete(ctx: ContextTypes.DEFAULT_TYPE, message, delay: int):
+    tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
+    task = asyncio.create_task(
+        _delete_message_later(ctx.bot, message.chat_id, message.message_id, delay)
+    )
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def send_generic_error(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    try:
+        message = await ctx.bot.send_message(chat_id=chat_id, text="Произошла ошибка.")
+        schedule_delete(ctx, message, 15)
+    except Exception:
+        log.exception("Не удалось отправить сообщение об ошибке")
+
+
+async def delete_message_safely(message):
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except Exception as exc:
+        log.debug("Не удалось удалить сообщение %s: %s", getattr(message, "message_id", "?"), exc)
+
+
 async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
-    msg = update.effective_message
-    status = await msg.reply_text("🔎 Ищу до 10 вариантов…")
+    chat_id = update.effective_chat.id
     try:
         async with SEARCH_LOCK:
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(None, _search_tracks, query)
         if not results:
-            await status.edit_text("😕 Ничего не найдено. Попробуй другое название.")
+            await send_generic_error(ctx, chat_id)
             return
+
         token = secrets.token_hex(4)
         ctx.user_data["music_search"] = {
             "token": token,
             "results": results,
             "created": time.time(),
         }
-        lines = ["🎵 **Нашёл варианты. Выбери номер:**"]
+        lines = ["🎵 Выбери трек:"]
         buttons = []
         for i, item in enumerate(results, 1):
             duration = item.get("duration")
@@ -214,14 +248,78 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             lines.append(f"{i}. {item['title']}{time_label}")
             buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
         keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-        await status.edit_text(
+        result_message = await update.effective_message.reply_text(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
         )
-    except Exception as exc:
+        schedule_delete(ctx, result_message, 600)
+    except Exception:
         log.exception("Ошибка поиска")
-        await status.edit_text("❌ Не удалось выполнить поиск. Попробуй ещё раз.")
+        await send_generic_error(ctx, chat_id)
+
+
+async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str, selection_message=None):
+    global _last_finish
+    chat_id = update.effective_chat.id
+    is_url = bool(URL_RE.fullmatch(query))
+    if is_url and not YT_RE.search(query):
+        await delete_message_safely(selection_message)
+        await send_generic_error(ctx, chat_id)
+        return
+
+    async with DL_LOCK:
+        if _last_finish:
+            wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        workdir = Path(tempfile.mkdtemp(prefix="dl_"))
+        info = path = None
+        last_err = ""
+        try:
+            loop = asyncio.get_running_loop()
+            for i, (name, use_cookies, clients) in enumerate(STRATEGIES, 1):
+                try:
+                    log.info("Попытка %d/%d: %s | %s", i, len(STRATEGIES), name, query)
+                    info, path = await loop.run_in_executor(
+                        None, _download, query, is_url, workdir, use_cookies, clients
+                    )
+                    if path:
+                        break
+                    if info is None:
+                        last_err = "ничего не найдено"
+                        break
+                    last_err = "track exceeds configured duration"
+                    break
+                except Exception as exc:
+                    last_err = str(exc)
+                    log.warning("Стратегия «%s» не сработала: %s", name, last_err[:300])
+
+            if not path:
+                raise RuntimeError(last_err or "download failed")
+
+            if path.stat().st_size > TG_LIMIT:
+                raise RuntimeError("file exceeds Telegram upload limit")
+
+            info = info or {}
+            with open(path, "rb") as audio_file:
+                await ctx.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    title=info.get("track") or info.get("title"),
+                    performer=info.get("artist") or info.get("uploader"),
+                    duration=int(info.get("duration") or 0) or None,
+                    filename=f"{(info.get('title') or 'track')[:60]}.mp3",
+                    read_timeout=180,
+                    write_timeout=180,
+                )
+        except Exception:
+            log.exception("Не удалось обработать или отправить трек")
+            await send_generic_error(ctx, chat_id)
+        finally:
+            await delete_message_safely(selection_message)
+            shutil.rmtree(workdir, ignore_errors=True)
+            _last_finish = time.monotonic()
 
 
 async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
@@ -303,18 +401,33 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         _, token, raw_index = query.data.split(":")
         index = int(raw_index)
-        if token != data.get("token") or time.time() - data.get("created", 0) > 900:
-            await query.message.reply_text("⌛ Этот список устарел. Напиши запрос ещё раз.")
+        if (
+            token != data.get("token")
+            or time.time() - data.get("created", 0) > 600
+            or ctx.user_data.get("music_processing_token") == token
+        ):
+            if token != ctx.user_data.get("music_processing_token"):
+                await delete_message_safely(query.message)
+                await send_generic_error(ctx, update.effective_chat.id)
             return
+
         results = data.get("results") or []
         if index < 0 or index >= len(results):
-            await query.message.reply_text("Не удалось найти выбранный вариант. Повтори поиск.")
+            await delete_message_safely(query.message)
+            await send_generic_error(ctx, update.effective_chat.id)
             return
+
         selected = results[index]
-        await query.edit_message_text(f"Выбрано: {selected['title']}")
-        await process(update, ctx, selected["url"])
+        ctx.user_data["music_processing_token"] = token
+        await query.edit_message_reply_markup(reply_markup=None)
+        try:
+            await process(update, ctx, selected["url"], selection_message=query.message)
+        finally:
+            if ctx.user_data.get("music_processing_token") == token:
+                ctx.user_data.pop("music_processing_token", None)
     except (ValueError, AttributeError):
-        await query.message.reply_text("Не удалось обработать выбор. Повтори поиск.")
+        await delete_message_safely(query.message)
+        await send_generic_error(ctx, update.effective_chat.id)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
