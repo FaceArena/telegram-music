@@ -330,8 +330,8 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         selected = results[index]
-        ctx.user_data["music_processing_token"] = token
         await callback.answer("Загружаю…")
+        ctx.user_data["music_processing_token"] = token
         try:
             await process(
                 update,
