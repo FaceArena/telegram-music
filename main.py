@@ -539,9 +539,11 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Привет! Напиши название трека — покажу до 10 вариантов. "
-        "Выбери номер, и я отправлю mp3.\n"
-        "Также можно прислать ссылку на YouTube. В группах: /music название"
+        "🎧 Привет! Я найду и пришлю любую песню.\n\n"
+        "Просто напиши название или имя исполнителя — я покажу список, "
+        "а ты выберешь нужный трек цифрой.\n"
+        "Можно сразу прислать ссылку на YouTube.\n\n"
+        f"В группе упомяни меня: @{ctx.bot.username} название песни"
     )
 
 
