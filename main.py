@@ -37,8 +37,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))
-MIN_DELAY = float(os.getenv("MIN_DELAY", "2"))
-MAX_DELAY = float(os.getenv("MAX_DELAY", "4"))
+# Small configurable cooldown; no multi-second artificial wait by default.
+MIN_DELAY = max(0.0, float(os.getenv("MIN_DELAY", "0.5")))
+MAX_DELAY = max(MIN_DELAY, float(os.getenv("MAX_DELAY", "1.0")))
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
@@ -50,7 +51,7 @@ URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
 DL_LOCK = asyncio.Lock()
-SEARCH_LOCK = asyncio.Lock()
+SEARCH_SEMAPHORE = asyncio.Semaphore(3)
 _last_finish = 0.0
 
 
@@ -77,15 +78,20 @@ COOKIES_SRC = load_cookies()
 
 
 def build_strategies():
-    s = []
+    # Keep a small, purposeful fallback chain. Trying every client separately
+    # can multiply one failed download into several long network timeouts.
     if COOKIES_SRC:
-        s.append(("cookies + tv/web_embedded/web", True, CLIENTS))
-        for c in CLIENTS:
-            s.append((f"cookies + {c}", True, [c]))
-    s.append(("без cookies: tv/web_embedded/web", False, CLIENTS))
-    for c in CLIENTS:
-        s.append((f"без cookies: {c}", False, [c]))
-    return s
+        return [
+            ("cookies + tv/web_embedded/web", True, CLIENTS),
+            ("cookies + web", True, ["web"]),
+            ("без cookies + web", False, ["web"]),
+            ("без cookies + tv/web_embedded", False, ["tv", "web_embedded"]),
+        ]
+    return [
+        ("tv/web_embedded/web", False, CLIENTS),
+        ("web", False, ["web"]),
+        ("tv/web_embedded", False, ["tv", "web_embedded"]),
+    ]
 
 
 STRATEGIES = build_strategies()
@@ -98,8 +104,11 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 2,
-        "socket_timeout": 30,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+        "file_access_retries": 1,
+        "socket_timeout": 15,
         "match_filter": match_filter_func(f"duration < {MAX_DURATION}"),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
@@ -211,7 +220,7 @@ async def send_generic_error(
 async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     chat_id = update.effective_chat.id
     try:
-        async with SEARCH_LOCK:
+        async with SEARCH_SEMAPHORE:
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(None, _search_tracks, query)
         if not results:
@@ -256,7 +265,7 @@ async def process(
         return
 
     async with DL_LOCK:
-        if _last_finish:
+        if _last_finish and MAX_DELAY > 0:
             wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
@@ -267,12 +276,16 @@ async def process(
         try:
             loop = asyncio.get_running_loop()
             for i, (name, use_cookies, clients) in enumerate(STRATEGIES, 1):
+                attempt_dir = workdir / f"attempt_{i}"
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+                attempt_started = time.monotonic()
                 try:
                     log.info("Попытка %d/%d: %s | %s", i, len(STRATEGIES), name, query)
                     info, path = await loop.run_in_executor(
-                        None, _download, query, is_url, workdir, use_cookies, clients
+                        None, _download, query, is_url, attempt_dir, use_cookies, clients
                     )
                     if path:
+                        log.info("Скачивание и конвертация завершены за %.1f с", time.monotonic() - attempt_started)
                         break
                     if info is None:
                         last_err = "no result"
@@ -281,7 +294,10 @@ async def process(
                     break
                 except Exception as exc:
                     last_err = str(exc)
-                    log.warning("Стратегия «%s» не сработала: %s", name, last_err[:300])
+                    log.warning(
+                        "Стратегия «%s» не сработала за %.1f с: %s",
+                        name, time.monotonic() - attempt_started, last_err[:300]
+                    )
 
             if not path:
                 raise RuntimeError(last_err or "download failed")
@@ -290,6 +306,7 @@ async def process(
                 raise RuntimeError("file exceeds Telegram upload limit")
 
             info = info or {}
+            upload_started = time.monotonic()
             with open(path, "rb") as audio_file:
                 await ctx.bot.send_audio(
                     chat_id=chat_id,
@@ -300,10 +317,14 @@ async def process(
                     filename=f"{(info.get('title') or 'track')[:60]}.mp3",
                     read_timeout=180,
                     write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
                 )
+            log.info("Отправка MP3 в Telegram завершена за %.1f с (%.1f МБ)",
+                     time.monotonic() - upload_started, path.stat().st_size / (1024 * 1024))
         except Exception:
             log.exception("Не удалось обработать или отправить трек")
-            await send_generic_error(ctx, chat_id)
+            await send_generic_error(ctx, chat_id, error_text)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
             _last_finish = time.monotonic()
