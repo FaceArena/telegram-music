@@ -7,10 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from telegram.error import BadRequest
+
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, _safe_cache_call, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -436,6 +438,19 @@ class DurationLimitTests(unittest.TestCase):
 
     def test_unknown_duration_preserves_existing_search_behavior(self):
         self.assertFalse(is_duration_over_limit(None, 1200))
+
+
+class CachedFileIdErrorTests(unittest.TestCase):
+    def test_explicit_invalid_file_identifier_error_allows_cache_invalidation(self):
+        self.assertTrue(
+            _is_invalid_file_id_error(BadRequest("Wrong file identifier/http URL specified"))
+        )
+
+    def test_chat_error_does_not_invalidate_cached_file_id(self):
+        self.assertFalse(_is_invalid_file_id_error(BadRequest("Chat not found")))
+
+    def test_transient_network_error_does_not_invalidate_cached_file_id(self):
+        self.assertFalse(_is_invalid_file_id_error(TimeoutError("request timed out")))
 
 
 if __name__ == "__main__":
