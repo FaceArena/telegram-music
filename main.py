@@ -731,14 +731,16 @@ async def process(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     query: str,
-    error_text: str = "Произошла ошибка.",
+    error_text: str = "⚠️ Произошла ошибка.",
+    notify_errors: bool = True,
 ):
     global _last_finish
     chat_id = update.effective_chat.id
     is_url = bool(URL_RE.fullmatch(query))
     if is_url and not is_youtube_url(query):
-        await send_generic_error(ctx, chat_id, error_text)
-        return
+        if notify_errors:
+            await send_generic_error(ctx, chat_id, error_text)
+        return False
 
     vid = video_id_of(query) if is_url else None
     if vid and CACHE:
@@ -758,15 +760,16 @@ async def process(
                 else:
                     # Rate limits, network errors, and chat errors do not invalidate a file_id.
                     log.warning("КЭШ: отправка %s временно не удалась; сохраняю file_id: %s", vid, str(exc)[:120])
-                    await send_generic_error(ctx, chat_id, error_text)
-                    return
+                    if notify_errors:
+                        await send_generic_error(ctx, chat_id, error_text)
+                    return False
             else:
                 _record_successful_delivery(
                     CACHE, vid, None, row[1], row[2], row[3],
                     update.effective_user.id if update.effective_user else None,
                 )
                 log.info("КЭШ: трек %s отправлен по file_id", vid)
-                return
+                return True
 
     async with DL_LOCK:
         if _last_finish and MAX_DELAY > 0:
@@ -777,6 +780,7 @@ async def process(
         workdir = Path(tempfile.mkdtemp(prefix="dl_"))
         info = path = None
         last_err = ""
+        delivered = False
         try:
             loop = asyncio.get_running_loop()
             for i, (name, use_cookies, clients) in enumerate(STRATEGIES, 1):
@@ -841,12 +845,15 @@ async def process(
                 )
             log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
                      time.monotonic() - upload_started, path.stat().st_size / (1024 * 1024))
+            delivered = True
         except Exception:
             log.exception("Не удалось обработать или отправить трек")
-            await send_generic_error(ctx, chat_id, error_text)
+            if notify_errors:
+                await send_generic_error(ctx, chat_id, error_text)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
             _last_finish = time.monotonic()
+    return delivered
 
 
 SPINNER = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
@@ -922,14 +929,18 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         data = _get_search_state(searches, token, picker.chat_id)
         if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
-            await callback.answer()
-            await send_generic_error(ctx, picker.chat_id)
+            await callback.answer(
+                "❗ Время истекло. Выполните новый поиск.",
+                show_alert=True,
+            )
             return
 
         results = data.get("results") or []
         if index < 0 or index >= len(results):
-            await callback.answer()
-            await send_generic_error(ctx, picker.chat_id)
+            await callback.answer(
+                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
+                show_alert=True,
+            )
             return
 
         selected = results[index]
@@ -941,14 +952,20 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         anim = None
         try:
-            await callback.answer("Загружаю…")
             anim = asyncio.create_task(_animate_picker(picker, index))
-            await process(
+            delivered = await process(
                 update,
                 ctx,
                 selected["url"],
-                error_text="❌ Не удалось загрузить.",
+                notify_errors=False,
             )
+            if delivered:
+                await callback.answer()
+            else:
+                await callback.answer(
+                    "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+                    show_alert=True,
+                )
         finally:
             if anim:
                 anim.cancel()
@@ -963,11 +980,12 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _release_processing(processing_tokens, token)
     except (ValueError, AttributeError, TypeError):
         try:
-            await callback.answer()
+            await callback.answer(
+                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
+                show_alert=True,
+            )
         except Exception:
             pass
-        if update.effective_chat:
-            await send_generic_error(ctx, update.effective_chat.id)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
