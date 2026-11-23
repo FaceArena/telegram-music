@@ -14,7 +14,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -520,6 +520,33 @@ class YouTubeCookiePermissionTests(unittest.TestCase):
             self.assertIsNotNone(path)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(path.read_bytes(), b"# Netscape HTTP Cookie File\\nsecret")
+
+
+class EnvironmentConfigurationTests(unittest.TestCase):
+    def test_invalid_integer_uses_default(self):
+        with patch.dict(os.environ, {"MAX_DURATION": "not-a-number"}):
+            self.assertEqual(_env_int("MAX_DURATION", 1200, minimum=1), 1200)
+
+    def test_integer_below_minimum_uses_default(self):
+        with patch.dict(os.environ, {"UPDATE_EVERY_HOURS": "0"}):
+            self.assertEqual(_env_int("UPDATE_EVERY_HOURS", 12, minimum=1), 12)
+
+    def test_valid_integer_is_preserved(self):
+        with patch.dict(os.environ, {"MAX_PARALLEL_DL": "5"}):
+            self.assertEqual(_env_int("MAX_PARALLEL_DL", 3, minimum=1), 5)
+
+    def test_invalid_float_uses_default(self):
+        with patch.dict(os.environ, {"MIN_DELAY": "fast"}):
+            self.assertEqual(_env_float("MIN_DELAY", 0.0, minimum=0.0), 0.0)
+
+    def test_negative_and_non_finite_floats_use_default(self):
+        for raw in ("-1.5", "nan", "inf", "-inf"):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"MIN_DELAY": raw}):
+                self.assertEqual(_env_float("MIN_DELAY", 0.0, minimum=0.0), 0.0)
+
+    def test_zero_is_allowed_when_minimum_is_zero(self):
+        with patch.dict(os.environ, {"SEARCH_CACHE_TTL": "0"}):
+            self.assertEqual(_env_int("SEARCH_CACHE_TTL", 21600, minimum=0), 0)
 
 
 if __name__ == "__main__":
