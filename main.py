@@ -24,7 +24,7 @@ load_dotenv()
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -259,6 +259,14 @@ def is_youtube_url(url: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_invalid_file_id_error(exc: Exception) -> bool:
+    """Only discard a cached Telegram file_id for an explicit identifier error."""
+    if not isinstance(exc, BadRequest):
+        return False
+    message = str(exc).lower()
+    return "file identifier" in message or "wrong file id" in message
 
 
 def _safe_cache_call(cache, method: str, *args, default=None, **kwargs):
@@ -597,7 +605,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         if PREFETCH_TOP:
             to_prefetch = [
                 x["url"] for x in results[:PREFETCH_TOP]
-                if not (CACHE and video_id_of(x["url"]) and CACHE.get_track(video_id_of(x["url"])))
+                if not (CACHE and video_id_of(x["url"]) and _safe_cache_call(CACHE, "get_track", video_id_of(x["url"])))
             ]
             schedule_prefetch(ctx, to_prefetch)
     except Exception:
@@ -645,8 +653,14 @@ async def process(
                     duration=row[3], read_timeout=60, write_timeout=60,
                 )
             except Exception as exc:
-                log.warning("КЭШ: file_id для %s не сработал (%s), качаю заново", vid, str(exc)[:100])
-                _safe_cache_call(CACHE, "drop_track", vid)
+                if _is_invalid_file_id_error(exc):
+                    log.warning("КЭШ: Telegram отклонил file_id для %s, удаляю запись и качаю заново", vid)
+                    _safe_cache_call(CACHE, "drop_track", vid)
+                else:
+                    # Rate limits, network errors, and chat errors do not invalidate a file_id.
+                    log.warning("КЭШ: отправка %s временно не удалась; сохраняю file_id: %s", vid, str(exc)[:120])
+                    await send_generic_error(ctx, chat_id, error_text)
+                    return
             else:
                 _record_successful_delivery(
                     CACHE, vid, None, row[1], row[2], row[3],
