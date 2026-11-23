@@ -289,6 +289,14 @@ class PrefetchSchedulingTests(unittest.TestCase):
 
 
 class SearchCacheRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.cache = Cache(Path(self.temp_dir.name) / "search_cache.db")
+
+    def tearDown(self):
+        self.cache.db.close()
+        self.temp_dir.cleanup()
+
     def test_corrupted_json_is_removed_and_treated_as_cache_miss(self):
         with self.cache.lock:
             self.cache.db.execute(
