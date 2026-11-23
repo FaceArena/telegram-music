@@ -10,7 +10,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, _safe_cache_call, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, _safe_cache_call, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -422,6 +422,20 @@ class RuntimeCacheFallbackTests(unittest.TestCase):
             _safe_cache_call(WorkingCache(), "get_track", "video_A123"),
             ("file-id", "Song", "Artist", 120),
         )
+
+
+class DurationLimitTests(unittest.TestCase):
+    def test_duration_below_limit_is_allowed(self):
+        self.assertFalse(is_duration_over_limit(1199, 1200))
+
+    def test_duration_equal_to_strict_limit_is_rejected(self):
+        self.assertTrue(is_duration_over_limit(1200, 1200))
+
+    def test_duration_above_limit_is_rejected(self):
+        self.assertTrue(is_duration_over_limit(1201, 1200))
+
+    def test_unknown_duration_preserves_existing_search_behavior(self):
+        self.assertFalse(is_duration_over_limit(None, 1200))
 
 
 if __name__ == "__main__":
