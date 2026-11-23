@@ -119,7 +119,6 @@ class TopMusicRankingTests(unittest.TestCase):
         self.assertEqual(rows[-1][3], 3)
 
     def test_existing_database_is_migrated_without_losing_track_cache(self):
-        self.cache.db.close()
         legacy_path = Path(self.temp_dir.name) / "legacy.db"
         legacy = sqlite3.connect(str(legacy_path))
         legacy.execute(
