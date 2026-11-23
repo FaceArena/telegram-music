@@ -1220,7 +1220,11 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📢 Перейти в канал", url="https://t.me/LunaAiroll")],
             [InlineKeyboardButton("🎧 Получить трек без подписки", callback_data=f"continue:{token}:{index}")],
         ])
-        await callback.answer()
+        try:
+            await callback.answer()
+        except Exception as exc:
+            # The invitation can still be sent if Telegram's short-lived callback expired.
+            log.debug("Не удалось закрыть callback выбора трека: %s", exc)
         await picker.reply_text(
             "💙 Помоги нашему проекту расти!\n\n"
             "Подпишись на Telegram-канал и поддержи нашу работу.\n\n"
