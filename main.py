@@ -845,17 +845,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_search(update, ctx, text[:200])
 
 
+def _update_ytdlp_sync() -> str:
+    """Run package installation outside the asyncio event-loop thread."""
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "yt-dlp[default]"],
+        check=True, capture_output=True, timeout=300,
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", "import yt_dlp.version as v;print(v.__version__)"],
+        check=True, capture_output=True, text=True, timeout=15,
+    )
+    return result.stdout.strip()
+
+
 async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
     before = yt_dlp.version.__version__
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "yt-dlp[default]"],
-            check=True, capture_output=True, timeout=300,
-        )
-        out = subprocess.run(
-            [sys.executable, "-c", "import yt_dlp.version as v;print(v.__version__)"],
-            capture_output=True, text=True,
-        ).stdout.strip()
+        loop = asyncio.get_running_loop()
+        out = await loop.run_in_executor(None, _update_ytdlp_sync)
         if out and out != before:
             log.info("yt-dlp обновлён %s → %s, перезапуск", before, out)
             os.execv(sys.executable, [sys.executable] + sys.argv)
