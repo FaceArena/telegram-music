@@ -69,7 +69,8 @@ URL_RE = re.compile(r"https?://\S+")
 
 MAX_PARALLEL_DL = max(1, int(os.getenv("MAX_PARALLEL_DL", "3")))
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
-SEARCH_SEMAPHORE = asyncio.Semaphore(3)
+MAX_PARALLEL_SEARCH = 3
+SEARCH_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_SEARCH)
 _last_finish = 0.0
 
 
@@ -434,7 +435,8 @@ async def _prefetch(urls: list):
             continue
         started = time.monotonic()
         try:
-            info = await loop.run_in_executor(None, _extract_only, url)
+            async with SEARCH_SEMAPHORE:
+                info = await loop.run_in_executor(None, _extract_only, url)
         except Exception as exc:
             log.info("Предзагрузка не удалась: %s", str(exc)[:120])
             return  # при ошибке (бот-проверка, 429) не продолжаем
@@ -939,7 +941,17 @@ def _update_ytdlp_sync() -> str:
 
 async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
     before = yt_dlp.version.__version__
+    acquired = []
     try:
+        # Pause all yt-dlp users before pip mutates the installed package.
+        # Search, prefetch, and download paths must acquire these same semaphores.
+        for _ in range(MAX_PARALLEL_DL):
+            await DL_LOCK.acquire()
+            acquired.append(DL_LOCK)
+        for _ in range(MAX_PARALLEL_SEARCH):
+            await SEARCH_SEMAPHORE.acquire()
+            acquired.append(SEARCH_SEMAPHORE)
+
         loop = asyncio.get_running_loop()
         out = await loop.run_in_executor(None, _update_ytdlp_sync)
         if out and out != before:
@@ -947,6 +959,9 @@ async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
             os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         log.warning("Не удалось обновить yt-dlp: %s", e)
+    finally:
+        for semaphore in reversed(acquired):
+            semaphore.release()
 
 
 async def post_init(app: Application):
