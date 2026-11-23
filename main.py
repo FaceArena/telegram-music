@@ -950,6 +950,19 @@ async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines))
 
 
+def strip_bot_mention(text: str, username: str | None):
+    """Remove only an exact @bot_username mention, not usernames with the same prefix."""
+    username = (username or "").lstrip("@")
+    if not username:
+        return False, text
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_])@{re.escape(username)}(?![A-Za-z0-9_])",
+        flags=re.IGNORECASE,
+    )
+    mentioned = pattern.search(text) is not None
+    return mentioned, pattern.sub("", text).strip() if mentioned else text
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text or (update.effective_user and update.effective_user.is_bot):
@@ -957,11 +970,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     chat = update.effective_chat
     if chat.type != "private":
-        uname = f"@{ctx.bot.username}"
-        mentioned = uname.lower() in text.lower()
+        mentioned, text = strip_bot_mention(text, ctx.bot.username)
         if not GROUP_REACT_ALL and not mentioned:
             return
-        text = re.sub(re.escape(uname), "", text, flags=re.I).strip()
         if not text or len(text) > 120 or text.count("\n") > 1:
             return
     if URL_RE.fullmatch(text):
