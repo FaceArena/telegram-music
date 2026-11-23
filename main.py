@@ -82,10 +82,12 @@ def load_cookies() -> Path | None:
     try:
         if b64:
             dest.write_bytes(base64.b64decode(b64))
+            dest.chmod(0o600)
             log.info("Cookies загружены из YOUTUBE_COOKIES_B64")
             return dest
         if path and Path(path).is_file():
             shutil.copy(path, dest)
+            dest.chmod(0o600)
             log.info("Cookies загружены из файла %s", path)
             return dest
     except Exception as e:
