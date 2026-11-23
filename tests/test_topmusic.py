@@ -8,7 +8,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache  # noqa: E402
+from main import Cache, _claim_processing  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -159,6 +159,21 @@ class TopMusicRankingTests(unittest.TestCase):
         )
         self.cache.drop_track("video_A123")
         self.assertIsNone(self.cache.get_track("video_A123"))
+
+
+class PickerProcessingLockTests(unittest.TestCase):
+    def test_same_picker_token_can_only_be_claimed_once(self):
+        user_data = {}
+
+        self.assertTrue(_claim_processing(user_data, "token-a"))
+        self.assertFalse(_claim_processing(user_data, "token-a"))
+        self.assertEqual(user_data["music_processing_token"], "token-a")
+
+    def test_different_picker_token_can_be_claimed(self):
+        user_data = {"music_processing_token": "token-a"}
+
+        self.assertTrue(_claim_processing(user_data, "token-b"))
+        self.assertEqual(user_data["music_processing_token"], "token-b")
 
 
 if __name__ == "__main__":
