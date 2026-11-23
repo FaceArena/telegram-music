@@ -488,6 +488,20 @@ def schedule_search_expiry(ctx: ContextTypes.DEFAULT_TYPE, message, token: str, 
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
+def schedule_prefetch(ctx: ContextTypes.DEFAULT_TYPE, urls: list) -> None:
+    """Keep at most one prefetch job active; prefetch is optional background work."""
+    if not urls:
+        return
+    bot_data = ctx.application.bot_data
+    current = bot_data.get("_prefetch_task")
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(_prefetch(urls))
+    bot_data["_prefetch_task"] = task
+    tasks = bot_data.setdefault("_cleanup_tasks", set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
 
 async def send_generic_error(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -547,14 +561,11 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         searches[token]["message_id"] = result_message.message_id
         schedule_search_expiry(ctx, result_message, token, 600)
         if PREFETCH_TOP:
-            tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
             to_prefetch = [
                 x["url"] for x in results[:PREFETCH_TOP]
                 if not (CACHE and video_id_of(x["url"]) and CACHE.get_track(video_id_of(x["url"])))
             ]
-            t = asyncio.create_task(_prefetch(to_prefetch))
-            tasks.add(t)
-            t.add_done_callback(tasks.discard)
+            schedule_prefetch(ctx, to_prefetch)
     except Exception:
         log.exception("Ошибка поиска")
         await send_generic_error(ctx, chat_id)
