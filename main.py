@@ -1272,11 +1272,12 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "🎧 Привет! Я найду и пришлю любую песню.\n\n"
-        "Просто напиши название или имя исполнителя — я покажу список, "
-        "а ты выберешь нужный трек цифрой.\n"
-        "Можно сразу прислать ссылку на YouTube.\n\n"
-        f"В группе упомяни меня: @{ctx.bot.username} название песни"
+        "💙 Помоги нашему проекту расти!\n\n"
+        "Подпишись на Telegram-канал и поддержи нашу работу.\n\n"
+        "✨ Подписка необязательна — ботом можно пользоваться и без неё.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/LunaAiroll")
+        ]]),
     )
 
 
