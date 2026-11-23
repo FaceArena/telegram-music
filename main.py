@@ -90,6 +90,7 @@ AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mp3").strip().lower()
 if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
+ERROR_NOTIFICATION_TTL = 15
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
@@ -601,16 +602,55 @@ def schedule_prefetch(ctx: ContextTypes.DEFAULT_TYPE, urls: list) -> None:
     task.add_done_callback(tasks.discard)
 
 
+async def _delete_error_later(bot, bot_data: dict, chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    active = bot_data.setdefault("_error_notifications", {})
+    locks = bot_data.setdefault("_error_notification_locks", {})
+    lock = locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        current = active.get(chat_id)
+        if not current or current.get("message_id") != message_id:
+            return
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as exc:
+            log.debug("Не удалось удалить уведомление об ошибке %s: %s", message_id, exc)
+        finally:
+            # Clear only this notification; a newer one must never be removed.
+            if active.get(chat_id, {}).get("message_id") == message_id:
+                active.pop(chat_id, None)
+
+
 async def send_generic_error(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
-    text: str = "Произошла ошибка.",
+    text: str = "⚠️ Произошла ошибка.",
 ):
-    try:
-        message = await ctx.bot.send_message(chat_id=chat_id, text=text)
-        schedule_delete(ctx, message, 15)
-    except Exception:
-        log.exception("Не удалось отправить сообщение об ошибке")
+    bot_data = ctx.application.bot_data
+    active = bot_data.setdefault("_error_notifications", {})
+    locks = bot_data.setdefault("_error_notification_locks", {})
+    lock = locks.setdefault(chat_id, asyncio.Lock())
+
+    # Serialize simultaneous failures in the same chat. The first error owns
+    # the single notification and its 15-second lifetime.
+    async with lock:
+        if chat_id in active:
+            return
+        try:
+            message = await ctx.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            log.exception("Не удалось отправить сообщение об ошибке")
+            return
+
+        active[chat_id] = {"message_id": message.message_id}
+        tasks = bot_data.setdefault("_cleanup_tasks", set())
+        task = asyncio.create_task(
+            _delete_error_later(
+                ctx.bot, bot_data, chat_id, message.message_id, ERROR_NOTIFICATION_TTL
+            )
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
 
 async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
@@ -907,7 +947,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 update,
                 ctx,
                 selected["url"],
-                error_text="Не удалось загрузить.",
+                error_text="❌ Не удалось загрузить.",
             )
         finally:
             if anim:
