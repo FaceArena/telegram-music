@@ -397,6 +397,7 @@ def _query_match_score(query: str, title: str) -> float:
             )
         previous = current
     ordered_coverage = previous[-1] / len(query_tokens)
+
     # A contiguous phrase match is useful, but should not outweigh full token coverage.
     phrase = " ".join(query_tokens)
     normalized_title = " ".join(title_tokens)
