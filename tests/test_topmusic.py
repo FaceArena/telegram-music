@@ -10,7 +10,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, _safe_cache_call, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -390,6 +390,38 @@ class DeliveryPersistenceTests(unittest.TestCase):
 
         self.assertEqual(cache.track_writes, 0)
         self.assertEqual(cache.downloads, 1)
+
+
+class RuntimeCacheFallbackTests(unittest.TestCase):
+    def test_cache_read_failure_returns_default_instead_of_raising(self):
+        class BrokenCache:
+            def get_track(self, video_id):
+                raise sqlite3.OperationalError("database is locked")
+
+        self.assertIsNone(_safe_cache_call(BrokenCache(), "get_track", "video_A123"))
+
+    def test_cache_write_failure_does_not_escape(self):
+        class BrokenCache:
+            def put_search(self, query, results):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        result = _safe_cache_call(
+            BrokenCache(), "put_search", "song", [{"title": "Song", "url": "https://youtu.be/abcdefghijk"}]
+        )
+        self.assertIsNone(result)
+
+    def test_missing_cache_uses_default(self):
+        self.assertEqual(_safe_cache_call(None, "get_track", "video_A123", default="miss"), "miss")
+
+    def test_successful_cache_operation_returns_its_value(self):
+        class WorkingCache:
+            def get_track(self, video_id):
+                return ("file-id", "Song", "Artist", 120)
+
+        self.assertEqual(
+            _safe_cache_call(WorkingCache(), "get_track", "video_A123"),
+            ("file-id", "Song", "Artist", 120),
+        )
 
 
 if __name__ == "__main__":
