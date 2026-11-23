@@ -15,7 +15,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -811,3 +811,78 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             123,
             "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
         )
+
+
+
+class SearchRelevanceRankingTests(unittest.TestCase):
+    def make_result(self, title, video_id):
+        return {
+            "title": title,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 180,
+        }
+
+    def test_all_query_words_beat_unrelated_tiktok_only_results(self):
+        results = [
+            self.make_result("Ke$ha - TiK ToK (Official Video)", "abcdefgh001"),
+            self.make_result("TikTok Shop tutorial", "abcdefgh002"),
+            self.make_result("All I Need - Clams Casino (TikTok Version)", "abcdefgh003"),
+            self.make_result("Clams Casino - All I Need", "abcdefgh004"),
+        ]
+        ranked = rank_search_results("All I Need TikTok", results)
+        self.assertEqual(ranked[0]["url"], results[2]["url"])
+        self.assertEqual(ranked[1]["url"], results[3]["url"])
+        self.assertNotIn(results[0], ranked[:2])
+        self.assertNotIn(results[1], ranked[:2])
+
+    def test_ke_sha_tik_tok_query_keeps_its_own_title_relevant(self):
+        results = [
+            self.make_result("All I Need - Clams Casino", "abcdefgh005"),
+            self.make_result("Ke$ha - TiK ToK", "abcdefgh006"),
+        ]
+        ranked = rank_search_results("Ke$ha TiK ToK", results)
+        self.assertEqual(ranked[0]["url"], results[1]["url"])
+
+    def test_case_punctuation_and_accents_are_normalized(self):
+        results = [
+            self.make_result("Beyoncé — Halo (Live)", "abcdefgh007"),
+            self.make_result("Halo - Beyoncé", "abcdefgh008"),
+        ]
+        ranked = rank_search_results("BEYONCE halo!", results)
+        self.assertEqual(ranked[0]["url"], results[0]["url"])
+
+    def test_exact_duplicate_video_ids_are_removed(self):
+        results = [
+            self.make_result("All I Need", "abcdefgh009"),
+            self.make_result("All I Need (duplicate metadata)", "abcdefgh009"),
+            self.make_result("All I Need (Slowed)", "abcdefgh010"),
+        ]
+        ranked = rank_search_results("All I Need", results)
+        self.assertEqual(len(ranked), 2)
+
+    def test_near_duplicate_versions_do_not_fill_first_positions(self):
+        results = [
+            self.make_result("All I Need Slowed", "abcdefgh011"),
+            self.make_result("All I Need Slowed + Reverb", "abcdefgh012"),
+            self.make_result("All I Need Live Acoustic", "abcdefgh013"),
+        ]
+        ranked = rank_search_results("All I Need", results)
+        self.assertEqual(ranked[0]["url"], results[0]["url"])
+        self.assertIn(results[2], ranked[:2])
+
+    def test_short_query_does_not_aggressively_filter(self):
+        results = [
+            self.make_result("Stay", "abcdefgh014"),
+            self.make_result("Stay With Me", "abcdefgh015"),
+        ]
+        self.assertEqual(len(rank_search_results("stay", results)), 2)
+
+    def test_empty_query_and_url_bypass_ranking(self):
+        results = [self.make_result("Other", "abcdefgh016")]
+        self.assertEqual(rank_search_results("", results), results)
+        url = "https://www.youtube.com/watch?v=abcdefgh016"
+        self.assertEqual(rank_search_results(url, results), results)
+
+    def test_empty_title_does_not_crash(self):
+        results = [{"title": "", "url": "https://youtu.be/abcdefgh017"}]
+        self.assertEqual(rank_search_results("some song", results), [])
