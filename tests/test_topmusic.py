@@ -15,7 +15,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_continue, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -706,8 +706,13 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             self.message_id = 456
             self.text = "🎵 Выбери трек:"
             self.reply_markup = None
+            self.sent = []
 
         async def edit_text(self, *args, **kwargs):
+            return None
+
+        async def reply_text(self, text, reply_markup=None):
+            self.sent.append((text, reply_markup))
             return None
 
     async def test_expired_picker_shows_telegram_alert_instead_of_chat_message(self):
@@ -729,7 +734,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             [("❗ Время истекло. Выполните новый поиск.", True)],
         )
 
-    async def test_failed_music_delivery_shows_distinct_telegram_alert(self):
+    async def test_pick_shows_optional_channel_prompt_without_downloading(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
         bot_data = {
@@ -740,35 +745,25 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
                     "created": time.time(),
                     "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
                 }
-            },
-            "music_processing_tokens": set(),
+            }
         }
         ctx = type("Context", (), {
             "application": type("Application", (), {"bot_data": bot_data})(),
         })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
+        update = type("Update", (), {"callback_query": callback})()
 
-        async def failed_process(*args, **kwargs):
-            return False
-
-        async def no_animation(*args, **kwargs):
-            await asyncio.sleep(10)
-
-        with patch("main.process", side_effect=failed_process), patch(
-            "main._animate_picker", side_effect=no_animation
-        ):
+        with patch("main.process", new_callable=unittest.mock.AsyncMock) as download:
             await on_pick(update, ctx)
 
-        self.assertEqual(
-            callback.answers,
-            [("⚠️ Не удалось отправить музыку. Попробуйте ещё раз.", True)],
-        )
+        download.assert_not_awaited()
+        self.assertEqual(len(picker.sent), 1)
+        prompt, markup = picker.sent[0]
+        self.assertIn("необязательно", prompt.lower())
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        self.assertEqual(buttons[0].url, "https://t.me/LunaAiroll")
+        self.assertEqual(buttons[1].callback_data, "continue:live-token:0")
 
-
-    async def test_failed_callback_alert_falls_back_to_temporary_chat_message(self):
+    async def test_expired_callback_answer_does_not_block_optional_prompt(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
 
@@ -784,6 +779,29 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
                     "created": time.time(),
                     "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
                 }
+            }
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {"callback_query": callback})()
+
+        await on_pick(update, ctx)
+
+        self.assertEqual(len(picker.sent), 1)
+        self.assertIn("необязательно", picker.sent[0][0].lower())
+
+    async def test_continue_without_subscription_uses_normal_download_flow(self):
+        message = self.FakePicker()
+        callback = self.FakeCallback("continue:live-token:0", message)
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
             },
             "music_processing_tokens": set(),
         }
@@ -795,22 +813,13 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             "effective_chat": type("Chat", (), {"id": 123})(),
         })()
 
-        async def failed_process(*args, **kwargs):
-            return False
+        with patch("main.process", new_callable=unittest.mock.AsyncMock, return_value=True) as download:
+            await on_continue(update, ctx)
 
-        async def no_animation(*args, **kwargs):
-            await asyncio.sleep(10)
-
-        with patch("main.process", side_effect=failed_process), patch(
-            "main._animate_picker", side_effect=no_animation
-        ), patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
-            await on_pick(update, ctx)
-
-        notify.assert_awaited_once_with(
-            ctx,
-            123,
-            "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+        download.assert_awaited_once_with(
+            update, ctx, "https://www.youtube.com/watch?v=abcdefghijk", notify_errors=False
         )
+        self.assertEqual(bot_data["music_processing_tokens"], set())
 
 
 
