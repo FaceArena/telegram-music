@@ -8,7 +8,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _release_processing  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -162,18 +162,34 @@ class TopMusicRankingTests(unittest.TestCase):
 
 
 class PickerProcessingLockTests(unittest.TestCase):
-    def test_same_picker_token_can_only_be_claimed_once(self):
-        user_data = {}
+    def test_shared_picker_token_can_only_be_claimed_once(self):
+        # All callback handlers in a group receive the same application-wide set.
+        shared_processing_tokens = set()
 
-        self.assertTrue(_claim_processing(user_data, "token-a"))
-        self.assertFalse(_claim_processing(user_data, "token-a"))
-        self.assertEqual(user_data["music_processing_token"], "token-a")
+        self.assertTrue(_claim_processing(shared_processing_tokens, "token-a"))
+        self.assertFalse(_claim_processing(shared_processing_tokens, "token-a"))
+        self.assertIn("token-a", shared_processing_tokens)
 
-    def test_different_picker_token_can_be_claimed(self):
-        user_data = {"music_processing_token": "token-a"}
+    def test_processing_claim_is_released_after_completion(self):
+        shared_processing_tokens = set()
+        self.assertTrue(_claim_processing(shared_processing_tokens, "token-a"))
 
-        self.assertTrue(_claim_processing(user_data, "token-b"))
-        self.assertEqual(user_data["music_processing_token"], "token-b")
+        _release_processing(shared_processing_tokens, "token-a")
+
+        self.assertTrue(_claim_processing(shared_processing_tokens, "token-a"))
+
+    def test_picker_state_is_available_to_other_members_of_same_chat(self):
+        state = {"chat_id": -100123, "created": 2_000_000_000, "results": ["song"]}
+        searches = {"token-a": state}
+
+        self.assertIs(_get_search_state(searches, "token-a", -100123), state)
+        self.assertIsNone(_get_search_state(searches, "token-a", 12345))
+
+    def test_expired_picker_state_is_removed(self):
+        searches = {"token-a": {"chat_id": -100123, "created": 1, "results": []}}
+
+        self.assertIsNone(_get_search_state(searches, "token-a", -100123))
+        self.assertNotIn("token-a", searches)
 
 
 if __name__ == "__main__":
