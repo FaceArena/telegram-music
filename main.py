@@ -413,6 +413,8 @@ def rank_search_results(query: str, results: list[dict]) -> list[dict]:
             seen_video_ids.add(video_id)
 
         tokens = set(_search_tokens(title))
+        if not tokens:
+            continue
         score = _query_match_score(query, title)
         # For multi-word queries, a result matching only a small fragment is noise.
         if len(query_tokens) >= 3 and score < 0.34:
