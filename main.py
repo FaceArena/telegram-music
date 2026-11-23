@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import secrets
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -291,6 +292,16 @@ def is_duration_over_limit(duration, max_duration: int) -> bool:
     return duration is not None and duration >= max_duration
 
 
+def clean_metadata(value, max_length: int = 160):
+    """Flatten untrusted external metadata before displaying or sending it."""
+    if value is None:
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cc")
+    text = " ".join(text.split())
+    return text[:max_length] or None
+
+
 def norm_query(q: str) -> str:
     return " ".join(q.lower().split())[:200]
 
@@ -481,7 +492,7 @@ def _search_tracks(query: str):
                             continue
                         url = f"https://www.youtube.com/watch?v={video_id}"
                     results.append({
-                        "title": entry.get("title") or "Без названия",
+                        "title": clean_metadata(entry.get("title")) or "Без названия",
                         "url": url,
                         "duration": duration,
                     })
@@ -591,7 +602,8 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         for i, item in enumerate(results, 1):
             duration = item.get("duration")
             time_label = f" · {int(duration // 60)}:{int(duration % 60):02d}" if duration else ""
-            lines.append(f"{i}. {item['title']}{time_label}")
+            title = clean_metadata(item.get("title")) or "Без названия"
+            lines.append(f"{i}. {title}{time_label}")
             buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
         keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
         try:
@@ -651,7 +663,9 @@ async def process(
         if row:
             try:
                 await ctx.bot.send_audio(
-                    chat_id=chat_id, audio=row[0], title=row[1], performer=row[2],
+                    chat_id=chat_id, audio=row[0],
+                    title=clean_metadata(row[1], 128),
+                    performer=clean_metadata(row[2], 128),
                     duration=row[3], read_timeout=60, write_timeout=60,
                 )
             except Exception as exc:
@@ -724,10 +738,10 @@ async def process(
                 sent = await ctx.bot.send_audio(
                     chat_id=chat_id,
                     audio=audio_file,
-                    title=info.get("track") or info.get("title"),
-                    performer=info.get("artist") or info.get("uploader"),
+                    title=clean_metadata(info.get("track") or info.get("title"), 128),
+                    performer=clean_metadata(info.get("artist") or info.get("uploader"), 128),
                     duration=int(info.get("duration") or 0) or None,
-                    filename=f"{(info.get('title') or 'track')[:60]}.{AUDIO_FORMAT}",
+                    filename=f"{clean_metadata(info.get('title'), 60) or 'track'}.{AUDIO_FORMAT}",
                     read_timeout=180,
                     write_timeout=180,
                     connect_timeout=30,
@@ -900,8 +914,9 @@ async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     medals = ["🥇", "🥈", "🥉"]
     for position, (video_id, title, performer, total) in enumerate(rows, 1):
         marker = medals[position - 1] if position <= 3 else f"{position}."
-        name = title or "Без названия"
-        artist = f" — {performer}" if performer else ""
+        name = clean_metadata(title, 120) or "Без названия"
+        safe_artist = clean_metadata(performer, 80)
+        artist = f" — {safe_artist}" if safe_artist else ""
         lines.append(f"{marker} {name}{artist} · {total} скач.")
     await update.effective_message.reply_text("\n".join(lines))
 

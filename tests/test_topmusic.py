@@ -12,7 +12,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, clean_metadata, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -485,6 +485,24 @@ class YtDlpUpdateCoordinationTests(unittest.TestCase):
                 search_gate.release()
 
         asyncio.run(scenario())
+
+
+class TrackMetadataSanitizationTests(unittest.TestCase):
+    def test_newlines_are_flattened_to_prevent_fake_picker_rows(self):
+        self.assertEqual(
+            clean_metadata("Song title\n🥇 1. Fake row\r\nArtist"),
+            "Song title 🥇 1. Fake row Artist",
+        )
+
+    def test_control_characters_are_removed(self):
+        self.assertEqual(clean_metadata("Song\x00\x01 title"), "Song title")
+
+    def test_metadata_is_truncated_to_limit(self):
+        self.assertEqual(clean_metadata("x" * 20, 8), "x" * 8)
+
+    def test_missing_metadata_returns_none(self):
+        self.assertIsNone(clean_metadata(None))
+        self.assertIsNone(clean_metadata("   "))
 
 
 if __name__ == "__main__":
