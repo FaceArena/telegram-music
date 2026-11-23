@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import yt_dlp
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, RetryAfter
@@ -91,6 +92,9 @@ if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
 ERROR_NOTIFICATION_TTL = 15
+AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()
+AUDD_API_URL = "https://api.audd.io/"
+MAX_VIDEO_RECOGNITION_SIZE = 20 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
@@ -974,6 +978,112 @@ async def process(
     return delivered
 
 
+async def recognize_video_with_audd(video_path: Path, filename: str, content_type: str):
+    """Recognize the music in an uploaded video using AudD's standard 12-second endpoint."""
+    if not AUDD_API_TOKEN:
+        raise RuntimeError("AUDD_API_TOKEN is not configured")
+
+    timeout = httpx.Timeout(35.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with video_path.open("rb") as video_file:
+            response = await client.post(
+                AUDD_API_URL,
+                data={"api_token": AUDD_API_TOKEN},
+                files={"file": (filename, video_file, content_type)},
+            )
+        response.raise_for_status()
+        payload = response.json()
+
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        error = payload.get("error", "AudD returned an unsuccessful response") if isinstance(payload, dict) else "Invalid AudD response"
+        raise RuntimeError(str(error)[:240])
+    result = payload.get("result")
+    return result if isinstance(result, dict) else None
+
+
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Recognize a track in a Telegram video and send its full YouTube audio."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or (update.effective_user and update.effective_user.is_bot):
+        return
+
+    media = message.video
+    filename = "telegram-video.mp4"
+    content_type = "video/mp4"
+    if media is None and message.document:
+        document = message.document
+        if not (document.mime_type or "").lower().startswith("video/"):
+            return
+        media = document
+        filename = Path(document.file_name or "telegram-video.mp4").name
+        content_type = document.mime_type or "application/octet-stream"
+    elif media is not None:
+        filename = Path(media.file_name or "telegram-video.mp4").name
+        content_type = media.mime_type or "video/mp4"
+
+    if media is None:
+        return
+
+    if chat.type != "private" and not GROUP_REACT_ALL:
+        mentioned, _ = strip_bot_mention(message.caption or "", ctx.bot.username)
+        if not mentioned:
+            return
+
+    if not AUDD_API_TOKEN:
+        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео пока не подключено: нужен AUDD_API_TOKEN.")
+        return
+
+    reported_size = getattr(media, "file_size", None)
+    if reported_size and reported_size > MAX_VIDEO_RECOGNITION_SIZE:
+        await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
+        return
+
+    workdir = Path(tempfile.mkdtemp(prefix="video_recognition_"))
+    try:
+        video_path = workdir / filename
+        telegram_file = await ctx.bot.get_file(media.file_id)
+        await telegram_file.download_to_drive(custom_path=str(video_path))
+        actual_size = video_path.stat().st_size
+        if actual_size <= 0:
+            raise RuntimeError("Downloaded video is empty")
+        if actual_size > MAX_VIDEO_RECOGNITION_SIZE:
+            await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
+            return
+
+        recognition = await recognize_video_with_audd(video_path, filename, content_type)
+        if not recognition:
+            await send_generic_error(ctx, chat.id, "🎵 Не удалось распознать музыку в этом видео.")
+            return
+
+        title = clean_metadata(recognition.get("title"), 120)
+        artist = clean_metadata(recognition.get("artist"), 100)
+        if not title or not artist:
+            await send_generic_error(ctx, chat.id, "🎵 Не удалось определить название и исполнителя.")
+            return
+
+        query = f"{artist} {title}"
+        async with SEARCH_SEMAPHORE:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, _search_tracks, query)
+        ranked = rank_search_results(query, results)
+        if not ranked or _query_match_score(query, ranked[0].get("title", "")) < 0.34:
+            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но полную версию найти не удалось.")
+            return
+
+        delivered = await process(update, ctx, ranked[0]["url"], notify_errors=False)
+        if not delivered:
+            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но скачать полную версию не удалось.")
+    except httpx.TimeoutException:
+        log.warning("AudD timeout while recognizing Telegram video")
+        await send_generic_error(ctx, chat.id, "⚠️ Сервис распознавания не ответил вовремя. Попробуйте ещё раз.")
+    except Exception:
+        log.exception("Не удалось распознать музыку в видео")
+        await send_generic_error(ctx, chat.id)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 SPINNER = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
 ANIM_INTERVAL = 1.2
 
@@ -1236,6 +1346,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
         app.job_queue.run_repeating(
