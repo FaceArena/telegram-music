@@ -490,12 +490,12 @@ class YtDlpUpdateCoordinationTests(unittest.TestCase):
 class TrackMetadataSanitizationTests(unittest.TestCase):
     def test_newlines_are_flattened_to_prevent_fake_picker_rows(self):
         self.assertEqual(
-            clean_metadata("Song title\\n🥇 1. Fake row\\r\\nArtist"),
+            clean_metadata("Song title\n🥇 1. Fake row\r\nArtist"),
             "Song title 🥇 1. Fake row Artist",
         )
 
     def test_control_characters_are_removed(self):
-        self.assertEqual(clean_metadata("Song\\x00\\x01 title"), "Song title")
+        self.assertEqual(clean_metadata("Song\x00\x01 title"), "Song title")
 
     def test_metadata_is_truncated_to_limit(self):
         self.assertEqual(clean_metadata("x" * 20, 8), "x" * 8)
