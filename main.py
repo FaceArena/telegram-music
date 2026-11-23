@@ -261,6 +261,17 @@ def is_youtube_url(url: str) -> bool:
         return False
 
 
+def _safe_cache_call(cache, method: str, *args, default=None, **kwargs):
+    """A runtime cache failure must not take down search, delivery, or ranking UX."""
+    if cache is None:
+        return default
+    try:
+        return getattr(cache, method)(*args, **kwargs)
+    except Exception as exc:
+        log.warning("Операция кэша %s не удалась: %s", method, exc)
+        return default
+
+
 def video_id_of(url: str):
     m = VIDEO_ID_RE.search(url or "")
     return m.group(1) if m else None
@@ -537,7 +548,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
     chat_id = update.effective_chat.id
     try:
         nq = norm_query(query)
-        results = CACHE.get_search(nq) if CACHE else None
+        results = _safe_cache_call(CACHE, "get_search", nq)
         if results:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
         else:
@@ -546,8 +557,8 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
                 search_started = time.monotonic()
                 results = await loop.run_in_executor(None, _search_tracks, query)
                 log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
-            if results and CACHE:
-                CACHE.put_search(nq, results)
+            if results:
+                _safe_cache_call(CACHE, "put_search", nq, results)
         if not results:
             await send_generic_error(ctx, chat_id)
             return
@@ -621,7 +632,7 @@ async def process(
 
     vid = video_id_of(query) if is_url else None
     if vid and CACHE:
-        row = CACHE.get_track(vid)
+        row = _safe_cache_call(CACHE, "get_track", vid)
         if row:
             try:
                 await ctx.bot.send_audio(
@@ -630,7 +641,7 @@ async def process(
                 )
             except Exception as exc:
                 log.warning("КЭШ: file_id для %s не сработал (%s), качаю заново", vid, str(exc)[:100])
-                CACHE.drop_track(vid)
+                _safe_cache_call(CACHE, "drop_track", vid)
             else:
                 _record_successful_delivery(
                     CACHE, vid, None, row[1], row[2], row[3],
@@ -855,7 +866,10 @@ async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not CACHE:
         await update.effective_message.reply_text("Рейтинг временно недоступен.")
         return
-    rows = CACHE.top_downloads(days=7, limit=10)
+    rows = _safe_cache_call(CACHE, "top_downloads", days=7, limit=10)
+    if rows is None:
+        await update.effective_message.reply_text("Рейтинг временно недоступен.")
+        return
     if not rows:
         await update.effective_message.reply_text(
             "🎧 Топ музыки за 7 дней\n\nПока скачиваний недостаточно. Будь первым!"
