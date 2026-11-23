@@ -784,7 +784,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("music", "Найти музыку"),
-        BotCommand("topmusic", "🎧 Топ музыки | Top music 🎧"),
+        BotCommand("topmusic", "🎧 Топ музыки | Top music"),
         BotCommand("help", "Помощь"),
     ])
 
