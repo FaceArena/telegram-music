@@ -621,8 +621,9 @@ async def _prefetch(urls: list):
         PREFETCH_CACHE.pop(k, None)
 
 
-def _search_tracks(query: str):
-    """Получить до 10 результатов поиска без скачивания аудио."""
+def _search_tracks(query: str, limit: int = 10):
+    """Получить ограниченное число результатов поиска без скачивания аудио."""
+    limit = max(1, min(int(limit), 30))
     workdir = Path(tempfile.mkdtemp(prefix="search_"))
     try:
         last_error = None
@@ -638,7 +639,7 @@ def _search_tracks(query: str):
                 opts["extract_flat"] = "in_playlist"
                 opts["skip_download"] = True
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    data = ydl.extract_info(f"ytsearch10:{query}", download=False)
+                    data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
                 entries = (data or {}).get("entries") or []
                 results = []
                 for entry in entries:
@@ -658,7 +659,7 @@ def _search_tracks(query: str):
                         "url": url,
                         "duration": duration,
                     })
-                return results[:10]
+                return results[:limit]
             except Exception as exc:
                 last_error = exc
                 log.warning("Поиск не сработал для клиента %s: %s", clients, str(exc)[:250])
@@ -771,11 +772,19 @@ async def send_generic_error(
         task.add_done_callback(tasks.discard)
 
 
-async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
+async def show_search(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    *,
+    video_recognition: bool = False,
+):
     chat_id = update.effective_chat.id
     try:
         nq = norm_query(query)
-        results = _safe_cache_call(CACHE, "get_search", nq)
+        # Recognition needs a wider candidate pool because short previews and
+        # unrelated results are filtered before presenting the same 10-item picker.
+        results = None if video_recognition else _safe_cache_call(CACHE, "get_search", nq)
         cache_hit = bool(results)
         if cache_hit:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
@@ -783,12 +792,26 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             async with SEARCH_SEMAPHORE:
                 loop = asyncio.get_running_loop()
                 search_started = time.monotonic()
-                results = await loop.run_in_executor(None, _search_tracks, query)
+                results = await loop.run_in_executor(
+                    None, _search_tracks, query, 30 if video_recognition else 10
+                )
                 log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
         # Rank on both cache hits and fresh searches so existing 6-hour cache entries
         # immediately benefit from ranking changes without a schema migration.
         results = rank_search_results(query, results)
-        if results and not cache_hit:
+        if video_recognition:
+            results = [
+                item for item in results
+                if (item.get("duration") is None or item.get("duration") >= 60)
+                and _query_match_score(query, clean_metadata(item.get("title")) or "") >= 0.34
+            ]
+            if not results:
+                await send_generic_error(
+                    ctx, chat_id,
+                    "🎵 Песня распознана, но подходящих полных версий пока не найдено. Попробуй другое видео."
+                )
+                return
+        if results and not cache_hit and not video_recognition:
             _safe_cache_call(CACHE, "put_search", nq, results)
         if not results:
             await send_generic_error(ctx, chat_id)
@@ -1087,7 +1110,7 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Reuse the normal picker: show up to 10 relevant, diversified versions
         # instead of silently downloading the first match returned by YouTube.
         query = f"{artist} {title}"
-        await show_search(update, ctx, query)
+        await show_search(update, ctx, query, video_recognition=True)
     except httpx.TimeoutException:
         log.warning("AudD timeout while recognizing Telegram video")
         await send_generic_error(ctx, chat.id, "⚠️ AudD не ответил вовремя. Попробуй ещё раз.")
