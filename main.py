@@ -785,7 +785,6 @@ async def post_init(app: Application):
         BotCommand("start", "Запустить бота"),
         BotCommand("music", "Найти музыку"),
         BotCommand("topmusic", "🎧 Топ музыки | Top music"),
-        BotCommand("help", "Помощь"),
     ])
 
 
@@ -798,7 +797,6 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("music", cmd_music))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
