@@ -835,6 +835,16 @@ class SearchRelevanceRankingTests(unittest.TestCase):
         self.assertNotIn(results[0], ranked[:2])
         self.assertNotIn(results[1], ranked[:2])
 
+    def test_split_tik_tok_query_matches_tiktok_title_without_false_positive(self):
+        results = [
+            self.make_result("Ke$ha - TiK ToK (Official Video)", "abcdefgh018"),
+            self.make_result("All I Need - Clams Casino (TikTok Version)", "abcdefgh019"),
+            self.make_result("Clams Casino - All I Need", "abcdefgh020"),
+        ]
+        ranked = rank_search_results("All I Need tik tok", results)
+        self.assertEqual(ranked[0]["url"], results[1]["url"])
+        self.assertNotEqual(ranked[0]["url"], results[0]["url"])
+
     def test_ke_sha_tik_tok_query_keeps_its_own_title_relevant(self):
         results = [
             self.make_result("All I Need - Clams Casino", "abcdefgh005"),
