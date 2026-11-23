@@ -450,6 +450,26 @@ def schedule_delete(ctx: ContextTypes.DEFAULT_TYPE, message, delay: int):
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
+async def _expire_search_later(bot, searches: dict, token: str, chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    state = searches.get(token)
+    if state and state.get("message_id") == message_id:
+        searches.pop(token, None)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        log.debug("Не удалось удалить список выбора %s: %s", message_id, exc)
+
+
+def schedule_search_expiry(ctx: ContextTypes.DEFAULT_TYPE, message, token: str, delay: int = 600):
+    tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
+    searches = ctx.application.bot_data.setdefault("music_searches", {})
+    task = asyncio.create_task(
+        _expire_search_later(ctx.bot, searches, token, message.chat_id, message.message_id, delay)
+    )
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
 
 async def send_generic_error(
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -482,11 +502,13 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             await send_generic_error(ctx, chat_id)
             return
 
-        token = secrets.token_hex(4)
-        ctx.user_data["music_search"] = {
-            "token": token,
+        token = secrets.token_hex(8)
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        # Register before sending: a very fast callback may arrive before reply_text returns.
+        searches[token] = {
             "results": results,
             "created": time.time(),
+            "chat_id": chat_id,
         }
         lines = ["🎵 Выбери трек:"]
         buttons = []
@@ -496,11 +518,16 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
             lines.append(f"{i}. {item['title']}{time_label}")
             buttons.append(InlineKeyboardButton(str(i), callback_data=f"pick:{token}:{i-1}"))
         keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-        result_message = await update.effective_message.reply_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        schedule_delete(ctx, result_message, 600)
+        try:
+            result_message = await update.effective_message.reply_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception:
+            searches.pop(token, None)
+            raise
+        searches[token]["message_id"] = result_message.message_id
+        schedule_search_expiry(ctx, result_message, token, 600)
         if PREFETCH_TOP:
             tasks = ctx.application.bot_data.setdefault("_cleanup_tasks", set())
             to_prefetch = [
@@ -666,41 +693,63 @@ async def _animate_picker(message, index: int):
         await asyncio.sleep(ANIM_INTERVAL)
 
 
-def _claim_processing(user_data: dict, token: str) -> bool:
-    """Atomically claim a picker token before yielding control to the event loop."""
-    if user_data.get("music_processing_token") == token:
+def _claim_processing(processing_tokens: set, token: str) -> bool:
+    """Atomically claim a picker token shared by every user in the chat."""
+    if token in processing_tokens:
         return False
-    user_data["music_processing_token"] = token
+    processing_tokens.add(token)
     return True
+
+
+def _release_processing(processing_tokens: set, token: str) -> None:
+    processing_tokens.discard(token)
+
+
+def _get_search_state(searches: dict, token: str, chat_id: int):
+    """Return a live picker state only for the chat where it was created."""
+    state = searches.get(token)
+    if not state or state.get("chat_id") != chat_id:
+        return None
+    if time.time() - state.get("created", 0) > 600:
+        searches.pop(token, None)
+        return None
+    return state
 
 
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
-    data = ctx.user_data.get("music_search") or {}
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
-        if token != data.get("token") or time.time() - data.get("created", 0) > 600:
+        picker = callback.message
+        if not picker:
             await callback.answer()
-            await send_generic_error(ctx, update.effective_chat.id)
             return
+
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        data = _get_search_state(searches, token, picker.chat_id)
+        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
+            await callback.answer()
+            await send_generic_error(ctx, picker.chat_id)
+            return
+
         results = data.get("results") or []
         if index < 0 or index >= len(results):
             await callback.answer()
-            await send_generic_error(ctx, update.effective_chat.id)
+            await send_generic_error(ctx, picker.chat_id)
             return
 
         selected = results[index]
-        # Claim synchronously: no await may occur between the check and the write.
-        if not _claim_processing(ctx.user_data, token):
+        processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
+        # The set is application-wide, so two group members cannot race the same picker.
+        if not _claim_processing(processing_tokens, token):
             await callback.answer()
             return
 
-        picker = callback.message
         anim = None
         try:
             await callback.answer("Загружаю…")
-            anim = asyncio.create_task(_animate_picker(picker, index)) if picker else None
+            anim = asyncio.create_task(_animate_picker(picker, index))
             await process(
                 update,
                 ctx,
@@ -718,14 +767,14 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
                 except Exception as exc:
                     log.debug("Не удалось восстановить окно выбора: %s", exc)
-            if ctx.user_data.get("music_processing_token") == token:
-                ctx.user_data.pop("music_processing_token", None)
-    except (ValueError, AttributeError):
+            _release_processing(processing_tokens, token)
+    except (ValueError, AttributeError, TypeError):
         try:
             await callback.answer()
         except Exception:
             pass
-        await send_generic_error(ctx, update.effective_chat.id)
+        if update.effective_chat:
+            await send_generic_error(ctx, update.effective_chat.id)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
