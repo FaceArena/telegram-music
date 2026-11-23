@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sqlite3
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +10,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -220,6 +222,35 @@ class YouTubeUrlValidationTests(unittest.TestCase):
         for url in invalid_urls:
             with self.subTest(url=url):
                 self.assertFalse(is_youtube_url(url))
+
+
+class YtDlpUpdateAsyncTests(unittest.TestCase):
+    def test_package_update_does_not_block_event_loop(self):
+        async def scenario():
+            finished = asyncio.Event()
+            current_version = "test-version"
+
+            def slow_update():
+                time.sleep(0.08)
+                return current_version
+
+            async def run_update():
+                with patch("main.yt_dlp.version.__version__", current_version), patch(
+                    "main._update_ytdlp_sync", side_effect=slow_update
+                ):
+                    await update_ytdlp(None)
+                finished.set()
+
+            async def check_loop_responsive():
+                await asyncio.sleep(0.01)
+                return not finished.is_set()
+
+            _, remained_responsive = await asyncio.gather(
+                run_update(), check_loop_responsive()
+            )
+            return remained_responsive
+
+        self.assertTrue(asyncio.run(scenario()))
 
 
 if __name__ == "__main__":
