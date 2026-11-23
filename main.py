@@ -164,10 +164,13 @@ class Cache:
         if not video_id:
             return
         with self.lock:
+            now = time.time()
             self.db.execute(
                 "INSERT INTO downloads(video_id, title, performer, downloaded_at) VALUES (?,?,?,?)",
-                (video_id, title, performer, time.time()),
+                (video_id, title, performer, now),
             )
+            # Рейтинг использует только последние 7 дней — старые события не храним.
+            self.db.execute("DELETE FROM downloads WHERE downloaded_at < ?", (now - 7 * 86400,))
             self.db.commit()
 
     def top_downloads(self, days: int = 7, limit: int = 10):
