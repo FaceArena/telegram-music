@@ -14,7 +14,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -547,6 +547,26 @@ class EnvironmentConfigurationTests(unittest.TestCase):
     def test_zero_is_allowed_when_minimum_is_zero(self):
         with patch.dict(os.environ, {"SEARCH_CACHE_TTL": "0"}):
             self.assertEqual(_env_int("SEARCH_CACHE_TTL", 21600, minimum=0), 0)
+
+
+class GroupMentionParsingTests(unittest.TestCase):
+    def test_exact_mention_is_removed(self):
+        mentioned, query = strip_bot_mention("@MusicBot Daft Punk - One More Time", "musicbot")
+        self.assertTrue(mentioned)
+        self.assertEqual(query, "Daft Punk - One More Time")
+
+    def test_username_with_bot_name_as_prefix_does_not_trigger(self):
+        mentioned, query = strip_bot_mention("@musicbot_fake song", "musicbot")
+        self.assertFalse(mentioned)
+        self.assertEqual(query, "@musicbot_fake song")
+
+    def test_mention_inside_another_username_does_not_trigger(self):
+        mentioned, query = strip_bot_mention("user@musicbot song", "musicbot")
+        self.assertFalse(mentioned)
+        self.assertEqual(query, "user@musicbot song")
+
+    def test_missing_bot_username_does_not_trigger(self):
+        self.assertEqual(strip_bot_mention("@musicbot song", None), (False, "@musicbot song"))
 
 
 if __name__ == "__main__":
