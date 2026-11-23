@@ -128,11 +128,20 @@ class Cache:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS downloads ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT NOT NULL, "
-            "title TEXT, performer TEXT, downloaded_at REAL NOT NULL)"
+            "title TEXT, performer TEXT, downloaded_at REAL NOT NULL, user_id INTEGER)"
         )
+        # Безопасная миграция существующей БД: старые события останутся в таблице,
+        # но не попадут в новый рейтинг, поскольку Telegram user_id для них неизвестен.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(downloads)")}
+        if "user_id" not in columns:
+            self.db.execute("ALTER TABLE downloads ADD COLUMN user_id INTEGER")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_downloads_time_video "
             "ON downloads(downloaded_at, video_id)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloads_user_time "
+            "ON downloads(user_id, downloaded_at, id)"
         )
         self.db.commit()
 
@@ -160,16 +169,18 @@ class Cache:
             self.db.execute("DELETE FROM tracks WHERE key=?", (self.track_key(video_id),))
             self.db.commit()
 
-    def record_download(self, video_id: str, title, performer, duration=None):
-        if not video_id:
+    def record_download(self, video_id: str, title, performer, duration=None, user_id=None):
+        # Без Telegram user_id нельзя применить правило «один пользователь — одна песня».
+        if not video_id or user_id is None:
             return
         with self.lock:
             now = time.time()
             self.db.execute(
-                "INSERT INTO downloads(video_id, title, performer, downloaded_at) VALUES (?,?,?,?)",
-                (video_id, title, performer, now),
+                "INSERT INTO downloads(video_id, title, performer, downloaded_at, user_id) "
+                "VALUES (?,?,?,?,?)",
+                (video_id, title, performer, now, int(user_id)),
             )
-            # Рейтинг использует только последние 7 дней — старые события не храним.
+            # Рейтинг использует скользящее окно последних 7 дней.
             self.db.execute("DELETE FROM downloads WHERE downloaded_at < ?", (now - 7 * 86400,))
             self.db.commit()
 
@@ -177,9 +188,16 @@ class Cache:
         since = time.time() - days * 24 * 60 * 60
         with self.lock:
             return self.db.execute(
+                "WITH ranked_events AS ("
+                " SELECT video_id, title, performer, user_id, downloaded_at, id,"
+                " ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY downloaded_at ASC, id ASC) AS rn"
+                " FROM downloads WHERE downloaded_at >= ? AND user_id IS NOT NULL"
+                "), first_votes AS ("
+                " SELECT video_id, title, performer, downloaded_at FROM ranked_events WHERE rn = 1"
+                ") "
                 "SELECT video_id, MAX(title), MAX(performer), COUNT(*) AS total "
-                "FROM downloads WHERE downloaded_at >= ? "
-                "GROUP BY video_id ORDER BY total DESC, MAX(downloaded_at) DESC LIMIT ?",
+                "FROM first_votes GROUP BY video_id "
+                "ORDER BY total DESC, MAX(downloaded_at) DESC LIMIT ?",
                 (since, limit),
             ).fetchall()
 
@@ -520,7 +538,7 @@ async def process(
                     duration=row[3], read_timeout=60, write_timeout=60,
                 )
                 if CACHE:
-                    CACHE.record_download(vid, row[1], row[2], row[3])
+                    CACHE.record_download(vid, row[1], row[2], row[3], user_id=update.effective_user.id if update.effective_user else None)
                 log.info("КЭШ: трек %s отправлен по file_id", vid)
                 return
             except Exception as exc:
@@ -598,7 +616,7 @@ async def process(
                     CACHE.put_track(
                         successful_video_id, sent.audio.file_id, title, performer, duration,
                     )
-                    CACHE.record_download(successful_video_id, title, performer, duration)
+                    CACHE.record_download(successful_video_id, title, performer, duration, user_id=update.effective_user.id if update.effective_user else None)
             except Exception as exc:
                 log.warning("Не удалось сохранить в кэш: %s", exc)
             log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
