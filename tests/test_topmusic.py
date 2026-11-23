@@ -453,5 +453,39 @@ class CachedFileIdErrorTests(unittest.TestCase):
         self.assertFalse(_is_invalid_file_id_error(TimeoutError("request timed out")))
 
 
+class YtDlpUpdateCoordinationTests(unittest.TestCase):
+    def test_update_waits_for_active_download_and_search_work(self):
+        async def scenario():
+            download_gate = asyncio.Semaphore(1)
+            search_gate = asyncio.Semaphore(1)
+            with patch("main.DL_LOCK", download_gate), patch(
+                "main.MAX_PARALLEL_DL", 1
+            ), patch("main.SEARCH_SEMAPHORE", search_gate), patch(
+                "main.MAX_PARALLEL_SEARCH", 1
+            ), patch("main.yt_dlp.version.__version__", "same-version"), patch(
+                "main._update_ytdlp_sync", return_value="same-version"
+            ):
+                await download_gate.acquire()
+                download_update = asyncio.create_task(update_ytdlp(None))
+                await asyncio.sleep(0.01)
+                self.assertFalse(download_update.done())
+                download_gate.release()
+                await asyncio.wait_for(download_update, timeout=2)
+
+                await search_gate.acquire()
+                search_update = asyncio.create_task(update_ytdlp(None))
+                await asyncio.sleep(0.01)
+                self.assertFalse(search_update.done())
+                search_gate.release()
+                await asyncio.wait_for(search_update, timeout=2)
+
+                self.assertTrue(await asyncio.wait_for(download_gate.acquire(), timeout=1))
+                download_gate.release()
+                self.assertTrue(await asyncio.wait_for(search_gate.acquire(), timeout=1))
+                search_gate.release()
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
