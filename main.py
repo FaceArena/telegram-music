@@ -277,6 +277,11 @@ def video_id_of(url: str):
     return m.group(1) if m else None
 
 
+def is_duration_over_limit(duration, max_duration: int) -> bool:
+    """The yt-dlp filter is strict (< max_duration), so equality is rejected too."""
+    return duration is not None and duration >= max_duration
+
+
 def norm_query(q: str) -> str:
     return " ".join(q.lower().split())[:200]
 
@@ -457,7 +462,7 @@ def _search_tracks(query: str):
                     if not entry:
                         continue
                     duration = entry.get("duration")
-                    if duration and duration > MAX_DURATION:
+                    if is_duration_over_limit(duration, MAX_DURATION):
                         continue
                     video_id = entry.get("id")
                     url = entry.get("url") or entry.get("webpage_url")
