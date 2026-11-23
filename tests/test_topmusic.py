@@ -339,6 +339,8 @@ class SearchCacheRecoveryTests(unittest.TestCase):
             ("negative duration", -1),
             ("nan duration", float("nan")),
             ("boolean duration", True),
+            ("duration at configured limit", 1200),
+            ("unreasonably large integer duration", 10 ** 1000),
         ):
             with self.subTest(query=query):
                 with self.cache.lock:
