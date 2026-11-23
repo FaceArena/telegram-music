@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import yt_dlp
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, RetryAfter
@@ -91,6 +92,9 @@ if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
 ERROR_NOTIFICATION_TTL = 15
+AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()
+AUDD_API_URL = "https://api.audd.io/"
+MAX_VIDEO_RECOGNITION_SIZE = 20 * 1024 * 1024
 
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
@@ -974,6 +978,153 @@ async def process(
     return delivered
 
 
+def _extract_video_audio_sample(video_path: Path, audio_path: Path) -> None:
+    """Extract a short, compact audio sample; standard AudD accepts audio, not video."""
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_path),
+        "-t", "20",
+        "-vn", "-ac", "1", "-ar", "22050", "-b:a", "96k",
+        "-f", "mp3", str(audio_path),
+    ]
+    completed = subprocess.run(
+        command, capture_output=True, text=True, timeout=45, check=False
+    )
+    if completed.returncode != 0 or not audio_path.is_file() or audio_path.stat().st_size == 0:
+        details = (completed.stderr or "FFmpeg could not extract an audio stream").strip()
+        raise RuntimeError(details[-500:])
+
+
+async def recognize_video_with_audd(audio_path: Path):
+    """Recognize an extracted audio sample using AudD's standard endpoint."""
+    if not AUDD_API_TOKEN:
+        raise RuntimeError("AUDD_API_TOKEN is not configured")
+    timeout = httpx.Timeout(35.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with audio_path.open("rb") as audio_file:
+            response = await client.post(
+                AUDD_API_URL,
+                data={"api_token": AUDD_API_TOKEN},
+                files={"file": ("video-sample.mp3", audio_file, "audio/mpeg")},
+            )
+        response.raise_for_status()
+        payload = response.json()
+
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        error = payload.get("error_message") or payload.get("error") or "AudD returned an unsuccessful response"
+        raise RuntimeError(str(error)[:240])
+    result = payload.get("result")
+    return result if isinstance(result, dict) else None
+
+
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Recognize a track in a Telegram video and send its full YouTube audio."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or (update.effective_user and update.effective_user.is_bot):
+        return
+
+    media = message.video or message.video_note
+    filename = "telegram-video.mp4"
+    if media is None and message.document:
+        document = message.document
+        document_name = Path(document.file_name or "telegram-video.mp4").name
+        is_video = (document.mime_type or "").lower().startswith("video/") or Path(document_name).suffix.lower() in {
+            ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"
+        }
+        if not is_video:
+            return
+        media = document
+        filename = document_name
+    elif media is not None:
+        filename = Path(getattr(media, "file_name", None) or "telegram-video.mp4").name
+
+    if media is None:
+        return
+
+    if chat.type != "private" and not GROUP_REACT_ALL:
+        mentioned, _ = strip_bot_mention(message.caption or "", ctx.bot.username)
+        if not mentioned:
+            return
+
+    if not AUDD_API_TOKEN:
+        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео не настроено: добавь AUDD_API_TOKEN в Railway Variables.")
+        return
+
+    reported_size = getattr(media, "file_size", None)
+    if reported_size and reported_size > MAX_VIDEO_RECOGNITION_SIZE:
+        await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
+        return
+
+    workdir = Path(tempfile.mkdtemp(prefix="video_recognition_"))
+    progress_message = None
+    try:
+        progress_message = await message.reply_text("🎧 Распознаю музыку в видео…")
+        video_path = workdir / filename
+        audio_path = workdir / "recognition-sample.mp3"
+        telegram_file = await ctx.bot.get_file(media.file_id)
+        await telegram_file.download_to_drive(custom_path=str(video_path))
+        actual_size = video_path.stat().st_size
+        if actual_size <= 0:
+            raise RuntimeError("Downloaded video is empty")
+        if actual_size > MAX_VIDEO_RECOGNITION_SIZE:
+            await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
+            return
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _extract_video_audio_sample, video_path, audio_path)
+        recognition = await recognize_video_with_audd(audio_path)
+        if not recognition:
+            await send_generic_error(ctx, chat.id, "🎵 Не удалось распознать музыку. Попробуй видео, где музыка слышна с самого начала.")
+            return
+
+        title = clean_metadata(recognition.get("title"), 120)
+        artist = clean_metadata(recognition.get("artist"), 100)
+        if not title or not artist:
+            await send_generic_error(ctx, chat.id, "🎵 AudD не вернул название и исполнителя.")
+            return
+
+        query = f"{artist} {title}"
+        async with SEARCH_SEMAPHORE:
+            results = await loop.run_in_executor(None, _search_tracks, query)
+        ranked = rank_search_results(query, results)
+        # Avoid sending short previews when a full-length upload is available.
+        full_versions = [
+            item for item in ranked
+            if item.get("duration") is None or item.get("duration") >= 60
+        ]
+        candidate = next(
+            (
+                item for item in full_versions
+                if _query_match_score(query, item.get("title", "")) >= 0.34
+            ),
+            None,
+        )
+        if not candidate:
+            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но полную версию найти не удалось.")
+            return
+
+        delivered = await process(update, ctx, candidate["url"], notify_errors=False)
+        if not delivered:
+            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но скачать полную версию не удалось.")
+    except httpx.TimeoutException:
+        log.warning("AudD timeout while recognizing Telegram video")
+        await send_generic_error(ctx, chat.id, "⚠️ AudD не ответил вовремя. Попробуй ещё раз.")
+    except subprocess.TimeoutExpired:
+        log.warning("FFmpeg timed out while extracting video audio")
+        await send_generic_error(ctx, chat.id, "⚠️ Не удалось обработать видео вовремя.")
+    except Exception:
+        log.exception("Не удалось распознать музыку в видео")
+        await send_generic_error(ctx, chat.id, "⚠️ Не удалось обработать видео. Проверь, что в нём есть звук.")
+    finally:
+        if progress_message:
+            try:
+                await progress_message.delete()
+            except Exception:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 SPINNER = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
 ANIM_INTERVAL = 1.2
 
@@ -1236,6 +1387,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
         app.job_queue.run_repeating(
