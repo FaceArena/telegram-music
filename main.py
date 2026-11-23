@@ -204,9 +204,27 @@ class Cache:
     def get_search(self, q: str):
         with self.lock:
             row = self.db.execute("SELECT results, created FROM searches WHERE q=?", (q,)).fetchone()
-        if row and time.time() - row[1] < SEARCH_CACHE_TTL:
-            return json.loads(row[0])
-        return None
+        if not row or time.time() - row[1] >= SEARCH_CACHE_TTL:
+            return None
+        try:
+            results = json.loads(row[0])
+            if not isinstance(results, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("url"), str)
+                or not isinstance(item.get("title"), str)
+                for item in results
+            ):
+                raise ValueError("invalid search cache structure")
+            return results
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            log.warning("Повреждён кэш поиска для «%s», выполняю новый поиск: %s", q, exc)
+            # Delete only the exact stale/corrupt version; do not erase a newer write.
+            with self.lock:
+                self.db.execute(
+                    "DELETE FROM searches WHERE q=? AND created=?", (q, row[1])
+                )
+                self.db.commit()
+            return None
 
     def put_search(self, q: str, results: list):
         with self.lock:

@@ -288,5 +288,46 @@ class PrefetchSchedulingTests(unittest.TestCase):
         self.assertNotIn("_prefetch_task", bot_data)
 
 
+class SearchCacheRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.cache = Cache(Path(self.temp_dir.name) / "search_cache.db")
+
+    def tearDown(self):
+        self.cache.db.close()
+        self.temp_dir.cleanup()
+
+    def test_corrupted_json_is_removed_and_treated_as_cache_miss(self):
+        with self.cache.lock:
+            self.cache.db.execute(
+                "INSERT INTO searches(q, results, created) VALUES (?, ?, ?)",
+                ("broken query", "{not-json", time.time()),
+            )
+            self.cache.db.commit()
+
+        self.assertIsNone(self.cache.get_search("broken query"))
+        with self.cache.lock:
+            count = self.cache.db.execute(
+                "SELECT COUNT(*) FROM searches WHERE q=?", ("broken query",)
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_invalid_search_cache_shape_is_removed(self):
+        with self.cache.lock:
+            self.cache.db.execute(
+                "INSERT INTO searches(q, results, created) VALUES (?, ?, ?)",
+                ("wrong shape", '{"not": "a list"}', time.time()),
+            )
+            self.cache.db.commit()
+
+        self.assertIsNone(self.cache.get_search("wrong shape"))
+
+    def test_valid_search_cache_still_loads(self):
+        expected = [{"title": "Song", "url": "https://www.youtube.com/watch?v=abcdefghijk"}]
+        self.cache.put_search("valid query", expected)
+
+        self.assertEqual(self.cache.get_search("valid query"), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
