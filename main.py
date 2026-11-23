@@ -1067,11 +1067,23 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(None, _search_tracks, query)
         ranked = rank_search_results(query, results)
-        if not ranked or _query_match_score(query, ranked[0].get("title", "")) < 0.34:
+        # Avoid sending short previews when a full-length upload is available.
+        full_versions = [
+            item for item in ranked
+            if item.get("duration") is None or item.get("duration") >= 60
+        ]
+        candidate = next(
+            (
+                item for item in full_versions
+                if _query_match_score(query, item.get("title", "")) >= 0.34
+            ),
+            None,
+        )
+        if not candidate:
             await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но полную версию найти не удалось.")
             return
 
-        delivered = await process(update, ctx, ranked[0]["url"], notify_errors=False)
+        delivered = await process(update, ctx, candidate["url"], notify_errors=False)
         if not delivered:
             await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но скачать полную версию не удалось.")
     except httpx.TimeoutException:
