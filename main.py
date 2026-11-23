@@ -15,6 +15,7 @@ import threading
 import time
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -65,7 +66,6 @@ TG_LIMIT = 49 * 1024 * 1024
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
-YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
 MAX_PARALLEL_DL = max(1, int(os.getenv("MAX_PARALLEL_DL", "3")))
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
@@ -223,6 +223,24 @@ try:
 except Exception as _e:  # кэш — оптимизация, бот должен работать и без него
     CACHE = None
     log.warning("Кэш недоступен: %s", _e)
+
+
+def is_youtube_url(url: str) -> bool:
+    """Accept only HTTP(S) URLs whose actual hostname belongs to YouTube."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        if not (hostname == "youtu.be" or hostname == "youtube.com" or hostname.endswith(".youtube.com")):
+            return False
+        if parsed.port not in (None, 80, 443):
+            return False
+        return True
+    except ValueError:
+        return False
 
 
 def video_id_of(url: str):
@@ -551,7 +569,7 @@ async def process(
     global _last_finish
     chat_id = update.effective_chat.id
     is_url = bool(URL_RE.fullmatch(query))
-    if is_url and not YT_RE.search(query):
+    if is_url and not is_youtube_url(query):
         await send_generic_error(ctx, chat_id, error_text)
         return
 

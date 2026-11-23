@@ -8,7 +8,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _release_processing  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -190,6 +190,36 @@ class PickerProcessingLockTests(unittest.TestCase):
 
         self.assertIsNone(_get_search_state(searches, "token-a", -100123))
         self.assertNotIn("token-a", searches)
+
+
+class YouTubeUrlValidationTests(unittest.TestCase):
+    def test_accepts_real_youtube_hosts(self):
+        valid_urls = [
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            "https://youtube.com/watch?v=abcdefghijk",
+            "https://music.youtube.com/watch?v=abcdefghijk",
+            "https://youtu.be/abcdefghijk",
+            "http://m.youtube.com/watch?v=abcdefghijk",
+        ]
+        for url in valid_urls:
+            with self.subTest(url=url):
+                self.assertTrue(is_youtube_url(url))
+
+    def test_rejects_hosts_that_only_contain_youtube_text(self):
+        invalid_urls = [
+            "https://youtube.com.attacker.test/watch?v=abcdefghijk",
+            "https://attacker.test/?next=https://youtube.com/watch?v=abcdefghijk",
+            "https://youtu.be.attacker.test/abcdefghijk",
+            "http://127.0.0.1:8080/?next=youtube.com",
+            "http://localhost/?url=youtube.com",
+            "https://youtube.com@attacker.test/watch?v=abcdefghijk",
+            "ftp://youtube.com/watch?v=abcdefghijk",
+            "https://youtube.com:444/watch?v=abcdefghijk",
+            "https://youtube.com:invalid/watch?v=abcdefghijk",
+        ]
+        for url in invalid_urls:
+            with self.subTest(url=url):
+                self.assertFalse(is_youtube_url(url))
 
 
 if __name__ == "__main__":
