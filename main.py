@@ -1217,14 +1217,14 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # The channel invitation is deliberately optional. No membership check is
         # performed, and choosing to continue always reaches the normal download flow.
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Поддержать проект · @LunaAiroll", url="https://t.me/LunaAiroll")],
-            [InlineKeyboardButton("🎵 Продолжить без подписки", callback_data=f"continue:{token}:{index}")],
+            [InlineKeyboardButton("📢 Перейти в канал", url="https://t.me/LunaAiroll")],
+            [InlineKeyboardButton("🎧 Получить трек без подписки", callback_data=f"continue:{token}:{index}")],
         ])
         await callback.answer()
         await picker.reply_text(
-            "💙 Спасибо, что выбираешь нашего бота!\n\n"
-            "Поддержи развитие проекта — подпишись на наш Telegram-канал.\n\n"
-            "Это совершенно необязательно: можешь пропустить этот шаг и сразу получить свой трек 😊",
+            "💙 Помоги нашему проекту расти!\n\n"
+            "Подпишись на Telegram-канал и поддержи нашу работу.\n\n"
+            "✨ Но это необязательно — нажми кнопку ниже, и я сразу отправлю выбранный трек.",
             reply_markup=keyboard,
         )
     except (ValueError, AttributeError, TypeError):
@@ -1272,7 +1272,7 @@ async def on_continue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await send_generic_error(
                     ctx,
                     message.chat_id,
-                    "⚠️ Не удалось отправить музыку. Нажми «Продолжить без подписки» ещё раз.",
+                    "⚠️ Не удалось отправить музыку. Нажми «Получить трек без подписки» ещё раз.",
                 )
         finally:
             _release_processing(processing_tokens, token)
