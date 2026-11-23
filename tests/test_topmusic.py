@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import os
+import stat
 import sqlite3
 import time
 import tempfile
@@ -12,7 +14,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, clean_metadata, is_duration_over_limit, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -503,6 +505,21 @@ class TrackMetadataSanitizationTests(unittest.TestCase):
     def test_missing_metadata_returns_none(self):
         self.assertIsNone(clean_metadata(None))
         self.assertIsNone(clean_metadata("   "))
+
+
+class YouTubeCookiePermissionTests(unittest.TestCase):
+    def test_base64_cookie_file_is_created_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            encoded = base64.b64encode(b"# Netscape HTTP Cookie File\\nsecret").decode()
+            with patch("main.tempfile.gettempdir", return_value=tmp), patch.dict(
+                os.environ,
+                {"YOUTUBE_COOKIES_B64": encoded, "YOUTUBE_COOKIES_FILE": ""},
+            ):
+                path = load_cookies()
+
+            self.assertIsNotNone(path)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_bytes(), b"# Netscape HTTP Cookie File\\nsecret")
 
 
 if __name__ == "__main__":
