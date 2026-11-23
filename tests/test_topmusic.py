@@ -569,5 +569,22 @@ class GroupMentionParsingTests(unittest.TestCase):
         self.assertEqual(strip_bot_mention("@musicbot song", None), (False, "@musicbot song"))
 
 
+class RankingTieBreakTests(unittest.TestCase):
+    def test_equal_scores_and_timestamps_have_stable_video_id_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Cache(Path(tmp) / "ranking.db")
+            try:
+                with patch("main.time.time", return_value=2_000_000_000):
+                    cache.record_download("video_B123", "Song B", "Artist", user_id=101)
+                    cache.record_download("video_A123", "Song A", "Artist", user_id=202)
+                rows = cache.top_downloads(days=7, limit=10)
+                self.assertEqual(
+                    [row[0] for row in rows],
+                    ["video_A123", "video_B123"],
+                )
+            finally:
+                cache.db.close()
+
+
 if __name__ == "__main__":
     unittest.main()
