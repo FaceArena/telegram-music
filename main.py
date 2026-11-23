@@ -357,7 +357,18 @@ def _search_tokens(value: str) -> list[str]:
     """Normalize title/query words consistently, including accents and punctuation."""
     normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    return _SEARCH_TOKEN_RE.findall(normalized)
+    raw_tokens = _SEARCH_TOKEN_RE.findall(normalized)
+    # Treat the common split spelling "tik tok" like the single word "tiktok".
+    tokens = []
+    index = 0
+    while index < len(raw_tokens):
+        if raw_tokens[index:index + 2] == ["tik", "tok"]:
+            tokens.append("tiktok")
+            index += 2
+        else:
+            tokens.append(raw_tokens[index])
+            index += 1
+    return tokens
 
 
 def _query_match_score(query: str, title: str) -> float:
