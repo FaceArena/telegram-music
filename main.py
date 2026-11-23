@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -125,6 +125,15 @@ class Cache:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS searches (q TEXT PRIMARY KEY, results TEXT NOT NULL, created REAL)"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS downloads ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT NOT NULL, "
+            "title TEXT, performer TEXT, downloaded_at REAL NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloads_time_video "
+            "ON downloads(downloaded_at, video_id)"
+        )
         self.db.commit()
 
     @staticmethod
@@ -150,6 +159,29 @@ class Cache:
         with self.lock:
             self.db.execute("DELETE FROM tracks WHERE key=?", (self.track_key(video_id),))
             self.db.commit()
+
+    def record_download(self, video_id: str, title, performer, duration=None):
+        if not video_id:
+            return
+        with self.lock:
+            now = time.time()
+            self.db.execute(
+                "INSERT INTO downloads(video_id, title, performer, downloaded_at) VALUES (?,?,?,?)",
+                (video_id, title, performer, now),
+            )
+            # Рейтинг использует только последние 7 дней — старые события не храним.
+            self.db.execute("DELETE FROM downloads WHERE downloaded_at < ?", (now - 7 * 86400,))
+            self.db.commit()
+
+    def top_downloads(self, days: int = 7, limit: int = 10):
+        since = time.time() - days * 24 * 60 * 60
+        with self.lock:
+            return self.db.execute(
+                "SELECT video_id, MAX(title), MAX(performer), COUNT(*) AS total "
+                "FROM downloads WHERE downloaded_at >= ? "
+                "GROUP BY video_id ORDER BY total DESC, MAX(downloaded_at) DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
 
     def get_search(self, q: str):
         with self.lock:
@@ -487,6 +519,8 @@ async def process(
                     chat_id=chat_id, audio=row[0], title=row[1], performer=row[2],
                     duration=row[3], read_timeout=60, write_timeout=60,
                 )
+                if CACHE:
+                    CACHE.record_download(vid, row[1], row[2], row[3])
                 log.info("КЭШ: трек %s отправлен по file_id", vid)
                 return
             except Exception as exc:
@@ -556,14 +590,15 @@ async def process(
                     pool_timeout=30,
                 )
             try:
-                if CACHE and sent and sent.audio and (vid or info.get("id")):
+                successful_video_id = vid or info.get("id")
+                title = info.get("track") or info.get("title")
+                performer = info.get("artist") or info.get("uploader")
+                duration = int(info.get("duration") or 0) or None
+                if CACHE and sent and sent.audio and successful_video_id:
                     CACHE.put_track(
-                        vid or info.get("id") or "",
-                        sent.audio.file_id,
-                        info.get("track") or info.get("title"),
-                        info.get("artist") or info.get("uploader"),
-                        int(info.get("duration") or 0) or None,
+                        successful_video_id, sent.audio.file_id, title, performer, duration,
                     )
+                    CACHE.record_download(successful_video_id, title, performer, duration)
             except Exception as exc:
                 log.warning("Не удалось сохранить в кэш: %s", exc)
             log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
@@ -676,6 +711,26 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not CACHE:
+        await update.effective_message.reply_text("Рейтинг временно недоступен.")
+        return
+    rows = CACHE.top_downloads(days=7, limit=10)
+    if not rows:
+        await update.effective_message.reply_text(
+            "🎧 Топ музыки за 7 дней\n\nПока скачиваний недостаточно. Будь первым!"
+        )
+        return
+    lines = ["🎧 Топ музыки | Top music 🎧", "За последние 7 дней:", ""]
+    medals = ["🥇", "🥈", "🥉"]
+    for position, (video_id, title, performer, total) in enumerate(rows, 1):
+        marker = medals[position - 1] if position <= 3 else f"{position}."
+        name = title or "Без названия"
+        artist = f" — {performer}" if performer else ""
+        lines.append(f"{marker} {name}{artist} · {total} скач.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def cmd_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = " ".join(ctx.args).strip()
     if not query:
@@ -725,11 +780,27 @@ async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("Не удалось обновить yt-dlp: %s", e)
 
 
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Запустить бота"),
+        BotCommand("music", "Найти музыку"),
+        BotCommand("topmusic", "🎧 Топ музыки | Top music 🎧"),
+        BotCommand("help", "Помощь"),
+    ])
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("music", cmd_music))
+    app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
