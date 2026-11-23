@@ -896,3 +896,27 @@ class SearchRelevanceRankingTests(unittest.TestCase):
     def test_empty_title_does_not_crash(self):
         results = [{"title": "", "url": "https://youtu.be/abcdefgh017"}]
         self.assertEqual(rank_search_results("some song", results), [])
+
+
+class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_shows_only_channel_subscription_button(self):
+        from main import cmd_start
+
+        message = type("Message", (), {
+            "reply_text": unittest.mock.AsyncMock()
+        })()
+        update = type("Update", (), {"effective_message": message})()
+        ctx = type("Context", (), {
+            "bot": type("Bot", (), {"username": "music_test_bot"})()
+        })()
+
+        await cmd_start(update, ctx)
+
+        message.reply_text.assert_awaited_once()
+        args, kwargs = message.reply_text.await_args
+        self.assertIn("Помоги нашему проекту расти", args[0])
+        markup = kwargs["reply_markup"]
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].url, "https://t.me/LunaAiroll")
+        self.assertIsNone(buttons[0].callback_data)
