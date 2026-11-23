@@ -228,7 +228,7 @@ class Cache:
                 ") "
                 "SELECT video_id, MAX(title), MAX(performer), COUNT(*) AS total "
                 "FROM first_votes GROUP BY video_id "
-                "ORDER BY total DESC, MAX(downloaded_at) DESC LIMIT ?",
+                "ORDER BY total DESC, MAX(downloaded_at) DESC, video_id ASC LIMIT ?",
                 (since, limit),
             ).fetchall()
 
