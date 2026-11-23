@@ -962,10 +962,19 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if delivered:
                 await callback.answer()
             else:
-                await callback.answer(
-                    "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-                    show_alert=True,
-                )
+                try:
+                    await callback.answer(
+                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+                        show_alert=True,
+                    )
+                except Exception:
+                    # Telegram callback alerts expire quickly. If the alert can no
+                    # longer be shown, fall back to a short-lived chat notification.
+                    await send_generic_error(
+                        ctx,
+                        picker.chat_id,
+                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+                    )
         finally:
             if anim:
                 anim.cancel()
