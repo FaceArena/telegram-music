@@ -80,7 +80,7 @@ POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = _env_int("UPDATE_EVERY_HOURS", 12, minimum=1)
 # Предзагрузка данных о первых N результатах поиска: пока пользователь выбирает трек,
 # проходит обязательное ожидание YouTube (available_at), и при скачивании yt-dlp не спит.
-PREFETCH_TOP = _env_int("PREFETCH_TOP", 1, minimum=0)
+PREFETCH_TOP = max(0, _env_int("PREFETCH_TOP", 1))
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
 MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
@@ -95,7 +95,7 @@ TG_LIMIT = 49 * 1024 * 1024
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
 
-MAX_PARALLEL_DL = _env_int("MAX_PARALLEL_DL", 3, minimum=1)
+MAX_PARALLEL_DL = max(1, _env_int("MAX_PARALLEL_DL", 3))
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
 MAX_PARALLEL_SEARCH = 3
 SEARCH_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_SEARCH)
