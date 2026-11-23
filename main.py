@@ -721,7 +721,7 @@ async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🎧 Топ музыки за 7 дней\n\nПока скачиваний недостаточно. Будь первым!"
         )
         return
-    lines = ["🎧 Топ музыки | Top music 🎧", "За последние 7 дней:", ""]
+    lines = ["🎧 Топ музыки | Top music", "За последние 7 дней:", ""]
     medals = ["🥇", "🥈", "🥉"]
     for position, (video_id, title, performer, total) in enumerate(rows, 1):
         marker = medals[position - 1] if position <= 3 else f"{position}."
