@@ -239,10 +239,24 @@ class Cache:
             return None
         try:
             results = json.loads(row[0])
-            if not isinstance(results, list) or any(
+            if not isinstance(results, list) or len(results) > 10 or any(
                 not isinstance(item, dict)
                 or not isinstance(item.get("url"), str)
+                or not item["url"].startswith(("https://", "http://"))
                 or not isinstance(item.get("title"), str)
+                or (
+                    item.get("duration") is not None
+                    and (
+                        isinstance(item.get("duration"), bool)
+                        or not isinstance(item.get("duration"), (int, float))
+                        or (
+                            isinstance(item["duration"], float)
+                            and not math.isfinite(item["duration"])
+                        )
+                        or item["duration"] < 0
+                        or item["duration"] >= MAX_DURATION
+                    )
+                )
                 for item in results
             ):
                 raise ValueError("invalid search cache structure")

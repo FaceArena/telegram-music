@@ -1,4 +1,5 @@
 import asyncio
+import json
 import base64
 import os
 import stat
@@ -331,6 +332,48 @@ class SearchCacheRecoveryTests(unittest.TestCase):
         self.cache.put_search("valid query", expected)
 
         self.assertEqual(self.cache.get_search("valid query"), expected)
+
+    def test_invalid_duration_in_cached_result_is_removed(self):
+        for query, duration in (
+            ("text duration", "180"),
+            ("negative duration", -1),
+            ("nan duration", float("nan")),
+            ("boolean duration", True),
+            ("duration at configured limit", 1200),
+            ("unreasonably large integer duration", 10 ** 1000),
+        ):
+            with self.subTest(query=query):
+                with self.cache.lock:
+                    self.cache.db.execute(
+                        "INSERT INTO searches(q, results, created) VALUES (?, ?, ?)",
+                        (query, json.dumps([{
+                            "title": "Song",
+                            "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                            "duration": duration,
+                        }]), time.time()),
+                    )
+                    self.cache.db.commit()
+
+                self.assertIsNone(self.cache.get_search(query))
+                with self.cache.lock:
+                    count = self.cache.db.execute(
+                        "SELECT COUNT(*) FROM searches WHERE q=?", (query,)
+                    ).fetchone()[0]
+                self.assertEqual(count, 0)
+
+    def test_search_cache_rejects_more_than_ten_results(self):
+        results = [
+            {"title": f"Song {i}", "url": f"https://youtu.be/{i:011d}"}
+            for i in range(11)
+        ]
+        with self.cache.lock:
+            self.cache.db.execute(
+                "INSERT INTO searches(q, results, created) VALUES (?, ?, ?)",
+                ("too many", json.dumps(results), time.time()),
+            )
+            self.cache.db.commit()
+
+        self.assertIsNone(self.cache.get_search("too many"))
 
 
 class DeliveryPersistenceTests(unittest.TestCase):
