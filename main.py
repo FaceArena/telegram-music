@@ -350,6 +350,120 @@ def norm_query(q: str) -> str:
     return " ".join(q.lower().split())[:200]
 
 
+_SEARCH_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _search_tokens(value: str) -> list[str]:
+    """Normalize title/query words consistently, including accents and punctuation."""
+    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    raw_tokens = _SEARCH_TOKEN_RE.findall(normalized)
+    # Treat the common split spelling "tik tok" like the single word "tiktok".
+    tokens = []
+    index = 0
+    while index < len(raw_tokens):
+        if raw_tokens[index:index + 2] == ["tik", "tok"]:
+            tokens.append("tiktok")
+            index += 2
+        else:
+            tokens.append(raw_tokens[index])
+            index += 1
+    return tokens
+
+
+def _query_match_score(query: str, title: str) -> float:
+    """Score how much of a query is represented in a candidate title (0..1)."""
+    query_tokens = _search_tokens(query)
+    title_tokens = _search_tokens(title)
+    if not query_tokens or not title_tokens:
+        return 0.0
+
+    title_set = set(title_tokens)
+    coverage = sum(token in title_set for token in query_tokens) / len(query_tokens)
+
+    # Longest common subsequence rewards candidates that preserve query word order.
+    previous = [0] * (len(title_tokens) + 1)
+    for query_token in query_tokens:
+        current = [0]
+        for index, title_token in enumerate(title_tokens, 1):
+            current.append(
+                previous[index - 1] + 1
+                if query_token == title_token
+                else max(previous[index], current[-1])
+            )
+        previous = current
+    ordered_coverage = previous[-1] / len(query_tokens)
+
+    # A contiguous phrase match is useful, but should not outweigh full token coverage.
+    phrase = " ".join(query_tokens)
+    normalized_title = " ".join(title_tokens)
+    phrase_bonus = 0.12 if phrase and phrase in normalized_title else 0.0
+    return min(1.0, coverage * 0.72 + ordered_coverage * 0.28 + phrase_bonus)
+
+
+def rank_search_results(query: str, results: list[dict]) -> list[dict]:
+    """Reorder yt-dlp candidates by query relevance, then diversify close variants."""
+    if not isinstance(query, str) or not query.strip() or URL_RE.fullmatch(query.strip()):
+        return list(results or [])
+
+    query_tokens = _search_tokens(query)
+    if not query_tokens:
+        return list(results or [])
+
+    candidates = []
+    seen_video_ids = set()
+    for original_index, item in enumerate(results or []):
+        if not isinstance(item, dict):
+            continue
+        title = clean_metadata(item.get("title")) or ""
+        url = item.get("url") or ""
+        video_id = video_id_of(url)
+        if video_id:
+            if video_id in seen_video_ids:
+                continue
+            seen_video_ids.add(video_id)
+
+        tokens = set(_search_tokens(title))
+        if not tokens:
+            continue
+        score = _query_match_score(query, title)
+        # For multi-word queries, a result matching only a small fragment is noise.
+        if len(query_tokens) >= 3 and score < 0.34:
+            continue
+        candidates.append({
+            "item": item,
+            "index": original_index,
+            "score": score,
+            "tokens": tokens,
+        })
+
+    # Greedy maximal-marginal-relevance ordering: relevance remains dominant,
+    # while near-identical edits are spaced apart instead of filling the whole list.
+    ranked = []
+    remaining = candidates[:]
+    while remaining and len(ranked) < 10:
+        best = None
+        best_adjusted = float("-inf")
+        for candidate in remaining:
+            similarity = 0.0
+            if ranked and candidate["tokens"]:
+                similarity = max(
+                    len(candidate["tokens"] & chosen["tokens"])
+                    / max(1, len(candidate["tokens"] | chosen["tokens"]))
+                    for chosen in ranked
+                )
+            adjusted = candidate["score"] - similarity * 0.16
+            # Stable original-order tie-break keeps results predictable.
+            adjusted -= candidate["index"] * 1e-9
+            if adjusted > best_adjusted:
+                best_adjusted = adjusted
+                best = candidate
+        ranked.append(best)
+        remaining.remove(best)
+
+    return [candidate["item"] for candidate in ranked]
+
+
 def build_strategies():
     # Keep a small, purposeful fallback chain. Trying every client separately
     # can multiply one failed download into several long network timeouts.
@@ -658,7 +772,8 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
     try:
         nq = norm_query(query)
         results = _safe_cache_call(CACHE, "get_search", nq)
-        if results:
+        cache_hit = bool(results)
+        if cache_hit:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
         else:
             async with SEARCH_SEMAPHORE:
@@ -666,8 +781,11 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
                 search_started = time.monotonic()
                 results = await loop.run_in_executor(None, _search_tracks, query)
                 log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
-            if results:
-                _safe_cache_call(CACHE, "put_search", nq, results)
+        # Rank on both cache hits and fresh searches so existing 6-hour cache entries
+        # immediately benefit from ranking changes without a schema migration.
+        results = rank_search_results(query, results)
+        if results and not cache_hit:
+            _safe_cache_call(CACHE, "put_search", nq, results)
         if not results:
             await send_generic_error(ctx, chat_id)
             return
