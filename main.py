@@ -2,6 +2,7 @@ import asyncio
 import base64
 import copy
 import logging
+import math
 import os
 import random
 import re
@@ -42,18 +43,44 @@ logging.basicConfig(
 log = logging.getLogger("musicbot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        log.warning("Некорректное значение %s=%r; использую %s", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("%s=%s меньше допустимого минимума %s; использую %s", name, value, minimum, default)
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        log.warning("Некорректное значение %s=%r; использую %s", name, raw, default)
+        return default
+    if not math.isfinite(value) or (minimum is not None and value < minimum):
+        log.warning("Недопустимое значение %s=%r; использую %s", name, raw, default)
+        return default
+    return value
+
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-MAX_DURATION = int(os.getenv("MAX_DURATION", "1200"))
+MAX_DURATION = _env_int("MAX_DURATION", 1200, minimum=1)
 # Small configurable cooldown; no multi-second artificial wait by default.
-MIN_DELAY = max(0.0, float(os.getenv("MIN_DELAY", "0")))
-MAX_DELAY = max(MIN_DELAY, float(os.getenv("MAX_DELAY", "0")))
+MIN_DELAY = _env_float("MIN_DELAY", 0.0, minimum=0.0)
+MAX_DELAY = max(MIN_DELAY, _env_float("MAX_DELAY", 0.0, minimum=0.0))
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
-UPDATE_EVERY_HOURS = int(os.getenv("UPDATE_EVERY_HOURS", "12"))
+UPDATE_EVERY_HOURS = _env_int("UPDATE_EVERY_HOURS", 12, minimum=1)
 # Предзагрузка данных о первых N результатах поиска: пока пользователь выбирает трек,
 # проходит обязательное ожидание YouTube (available_at), и при скачивании yt-dlp не спит.
-PREFETCH_TOP = max(0, int(os.getenv("PREFETCH_TOP", "1")))
+PREFETCH_TOP = _env_int("PREFETCH_TOP", 1, minimum=0)
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
 MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
@@ -68,7 +95,7 @@ TG_LIMIT = 49 * 1024 * 1024
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
 
-MAX_PARALLEL_DL = max(1, int(os.getenv("MAX_PARALLEL_DL", "3")))
+MAX_PARALLEL_DL = _env_int("MAX_PARALLEL_DL", 3, minimum=1)
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
 MAX_PARALLEL_SEARCH = 3
 SEARCH_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_SEARCH)
@@ -104,7 +131,7 @@ COOKIES_SRC = load_cookies()
 # 2) результаты поиска по тексту запроса на SEARCH_CACHE_TTL секунд.
 # БД лежит в CACHE_DIR (по умолчанию /data, если есть том; иначе временная папка — тогда
 # кэш сбрасывается при деплое).
-SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", str(6 * 3600)))
+SEARCH_CACHE_TTL = _env_int("SEARCH_CACHE_TTL", 6 * 3600, minimum=0)
 VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
 
 
