@@ -666,6 +666,14 @@ async def _animate_picker(message, index: int):
         await asyncio.sleep(ANIM_INTERVAL)
 
 
+def _claim_processing(user_data: dict, token: str) -> bool:
+    """Atomically claim a picker token before yielding control to the event loop."""
+    if user_data.get("music_processing_token") == token:
+        return False
+    user_data["music_processing_token"] = token
+    return True
+
+
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
     data = ctx.user_data.get("music_search") or {}
@@ -676,10 +684,6 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await callback.answer()
             await send_generic_error(ctx, update.effective_chat.id)
             return
-        if ctx.user_data.get("music_processing_token") == token:
-            await callback.answer()
-            return
-
         results = data.get("results") or []
         if index < 0 or index >= len(results):
             await callback.answer()
@@ -687,11 +691,16 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         selected = results[index]
-        await callback.answer("Загружаю…")
-        ctx.user_data["music_processing_token"] = token
+        # Claim synchronously: no await may occur between the check and the write.
+        if not _claim_processing(ctx.user_data, token):
+            await callback.answer()
+            return
+
         picker = callback.message
-        anim = asyncio.create_task(_animate_picker(picker, index)) if picker else None
+        anim = None
         try:
+            await callback.answer("Загружаю…")
+            anim = asyncio.create_task(_animate_picker(picker, index)) if picker else None
             await process(
                 update,
                 ctx,
