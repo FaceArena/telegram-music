@@ -397,7 +397,6 @@ def _query_match_score(query: str, title: str) -> float:
             )
         previous = current
     ordered_coverage = previous[-1] / len(query_tokens)
-
     # A contiguous phrase match is useful, but should not outweigh full token coverage.
     phrase = " ".join(query_tokens)
     normalized_title = " ".join(title_tokens)
@@ -797,8 +796,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         token = secrets.token_hex(8)
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         # Register before sending: a very fast callback may arrive before reply_text returns.
-        searches[token] = {
-            "results": results,
+        searches[token] = {            "results": results,
             "created": time.time(),
             "chat_id": chat_id,
         }
@@ -1084,29 +1082,10 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_generic_error(ctx, chat.id, "🎵 AudD не вернул название и исполнителя.")
             return
 
+        # Reuse the normal picker: show up to 10 relevant, diversified versions
+        # instead of silently downloading the first match returned by YouTube.
         query = f"{artist} {title}"
-        async with SEARCH_SEMAPHORE:
-            results = await loop.run_in_executor(None, _search_tracks, query)
-        ranked = rank_search_results(query, results)
-        # Avoid sending short previews when a full-length upload is available.
-        full_versions = [
-            item for item in ranked
-            if item.get("duration") is None or item.get("duration") >= 60
-        ]
-        candidate = next(
-            (
-                item for item in full_versions
-                if _query_match_score(query, item.get("title", "")) >= 0.34
-            ),
-            None,
-        )
-        if not candidate:
-            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но полную версию найти не удалось.")
-            return
-
-        delivered = await process(update, ctx, candidate["url"], notify_errors=False)
-        if not delivered:
-            await send_generic_error(ctx, chat.id, f"🎵 Распознано: {artist} — {title}, но скачать полную версию не удалось.")
+        await show_search(update, ctx, query)
     except httpx.TimeoutException:
         log.warning("AudD timeout while recognizing Telegram video")
         await send_generic_error(ctx, chat.id, "⚠️ AudD не ответил вовремя. Попробуй ещё раз.")
@@ -1197,8 +1176,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         data = _get_search_state(searches, token, picker.chat_id)
-        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
-            await callback.answer(
+        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):            await callback.answer(
                 "❗ Время истекло. Выполните новый поиск.",
                 show_alert=True,
             )
