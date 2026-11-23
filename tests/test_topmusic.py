@@ -766,3 +766,48 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             callback.answers,
             [("⚠️ Не удалось отправить музыку. Попробуйте ещё раз.", True)],
         )
+
+
+    async def test_failed_callback_alert_falls_back_to_temporary_chat_message(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+
+        async def expired_callback_answer(*args, **kwargs):
+            raise RuntimeError("callback query expired")
+
+        callback.answer = expired_callback_answer
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": set(),
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        async def failed_process(*args, **kwargs):
+            return False
+
+        async def no_animation(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        with patch("main.process", side_effect=failed_process), patch(
+            "main._animate_picker", side_effect=no_animation
+        ), patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
+            await on_pick(update, ctx)
+
+        notify.assert_awaited_once_with(
+            ctx,
+            123,
+            "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+        )
