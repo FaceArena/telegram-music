@@ -796,7 +796,8 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         token = secrets.token_hex(8)
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         # Register before sending: a very fast callback may arrive before reply_text returns.
-        searches[token] = {            "results": results,
+        searches[token] = {
+            "results": results,
             "created": time.time(),
             "chat_id": chat_id,
         }
@@ -1176,7 +1177,8 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         data = _get_search_state(searches, token, picker.chat_id)
-        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):            await callback.answer(
+        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
+            await callback.answer(
                 "❗ Время истекло. Выполните новый поиск.",
                 show_alert=True,
             )
