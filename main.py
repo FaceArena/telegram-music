@@ -249,8 +249,12 @@ class Cache:
                     and (
                         isinstance(item.get("duration"), bool)
                         or not isinstance(item.get("duration"), (int, float))
-                        or not math.isfinite(item["duration"])
+                        or (
+                            isinstance(item["duration"], float)
+                            and not math.isfinite(item["duration"])
+                        )
                         or item["duration"] < 0
+                        or item["duration"] >= MAX_DURATION
                     )
                 )
                 for item in results
