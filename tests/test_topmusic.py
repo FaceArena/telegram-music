@@ -10,7 +10,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -251,6 +251,41 @@ class YtDlpUpdateAsyncTests(unittest.TestCase):
             return remained_responsive
 
         self.assertTrue(asyncio.run(scenario()))
+
+
+class PrefetchSchedulingTests(unittest.TestCase):
+    def test_only_one_prefetch_task_runs_at_a_time(self):
+        async def scenario():
+            gate = asyncio.Event()
+            bot_data = {"_cleanup_tasks": set()}
+            ctx = type("Context", (), {
+                "application": type("Application", (), {"bot_data": bot_data})()
+            })()
+
+            async def wait_for_release(urls):
+                await gate.wait()
+
+            with patch("main._prefetch", side_effect=wait_for_release):
+                schedule_prefetch(ctx, ["https://www.youtube.com/watch?v=first"])
+                first_task = bot_data["_prefetch_task"]
+                schedule_prefetch(ctx, ["https://www.youtube.com/watch?v=second"])
+                second_task = bot_data["_prefetch_task"]
+                self.assertIs(first_task, second_task)
+                self.assertFalse(first_task.done())
+                gate.set()
+                await first_task
+
+        asyncio.run(scenario())
+
+    def test_empty_prefetch_does_not_create_a_task(self):
+        bot_data = {"_cleanup_tasks": set()}
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})()
+        })()
+
+        schedule_prefetch(ctx, [])
+
+        self.assertNotIn("_prefetch_task", bot_data)
 
 
 if __name__ == "__main__":
