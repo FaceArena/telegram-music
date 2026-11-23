@@ -66,7 +66,6 @@ TG_LIMIT = 49 * 1024 * 1024
 # web требует решения JS-challenge (медленно) — оставлен только как запасной вариант
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
-YT_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
 MAX_PARALLEL_DL = max(1, int(os.getenv("MAX_PARALLEL_DL", "3")))
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
