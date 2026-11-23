@@ -1190,6 +1190,7 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
 
 
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for optional channel support after a track is selected."""
     callback = update.callback_query
     try:
         _, token, raw_index = callback.data.split(":")
@@ -1202,68 +1203,83 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         data = _get_search_state(searches, token, picker.chat_id)
         if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
-            await callback.answer(
-                "❗ Время истекло. Выполните новый поиск.",
-                show_alert=True,
-            )
+            await callback.answer("❗ Время истекло. Выполните новый поиск.", show_alert=True)
             return
 
         results = data.get("results") or []
         if index < 0 or index >= len(results):
             await callback.answer(
-                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
+                "⚠️ Не удалось выбрать трек. Попробуйте выполнить поиск ещё раз.",
                 show_alert=True,
             )
             return
 
-        selected = results[index]
-        processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
-        # The set is application-wide, so two group members cannot race the same picker.
-        if not _claim_processing(processing_tokens, token):
+        # The channel invitation is deliberately optional. No membership check is
+        # performed, and choosing to continue always reaches the normal download flow.
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Поддержать проект · @LunaAiroll", url="https://t.me/LunaAiroll")],
+            [InlineKeyboardButton("🎵 Продолжить без подписки", callback_data=f"continue:{token}:{index}")],
+        ])
+        await callback.answer()
+        await picker.reply_text(
+            "💙 Спасибо, что выбираешь нашего бота!\n\n"
+            "Поддержи развитие проекта — подпишись на наш Telegram-канал.\n\n"
+            "Это совершенно необязательно: можешь пропустить этот шаг и сразу получить свой трек 😊",
+            reply_markup=keyboard,
+        )
+    except (ValueError, AttributeError, TypeError):
+        try:
+            await callback.answer(
+                "⚠️ Не удалось выбрать трек. Попробуйте выполнить поиск ещё раз.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+
+
+async def on_continue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Continue to the selected track without checking channel membership."""
+    callback = update.callback_query
+    try:
+        _, token, raw_index = callback.data.split(":")
+        index = int(raw_index)
+        message = callback.message
+        if not message:
             await callback.answer()
             return
 
-        anim = None
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        data = _get_search_state(searches, token, message.chat_id)
+        results = (data or {}).get("results") or []
+        if not data or index < 0 or index >= len(results):
+            await callback.answer("❗ Время выбора истекло. Выполни новый поиск.", show_alert=True)
+            return
+
+        processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
+        if not _claim_processing(processing_tokens, token):
+            await callback.answer("⏳ Этот трек уже обрабатывается.")
+            return
+
         try:
-            anim = asyncio.create_task(_animate_picker(picker, index))
+            await callback.answer()
             delivered = await process(
                 update,
                 ctx,
-                selected["url"],
+                results[index]["url"],
                 notify_errors=False,
             )
-            if delivered:
-                await callback.answer()
-            else:
-                try:
-                    await callback.answer(
-                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-                        show_alert=True,
-                    )
-                except Exception:
-                    # Telegram callback alerts expire quickly. If the alert can no
-                    # longer be shown, fall back to a short-lived chat notification.
-                    await send_generic_error(
-                        ctx,
-                        picker.chat_id,
-                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-                    )
+            if not delivered:
+                await send_generic_error(
+                    ctx,
+                    message.chat_id,
+                    "⚠️ Не удалось отправить музыку. Нажми «Продолжить без подписки» ещё раз.",
+                )
         finally:
-            if anim:
-                anim.cancel()
-                try:
-                    await anim
-                except (asyncio.CancelledError, Exception):
-                    pass
-                try:  # вернуть окно выбора в исходный вид
-                    await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
-                except Exception as exc:
-                    log.debug("Не удалось восстановить окно выбора: %s", exc)
             _release_processing(processing_tokens, token)
     except (ValueError, AttributeError, TypeError):
         try:
             await callback.answer(
-                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
+                "⚠️ Не удалось продолжить. Выполни новый поиск.",
                 show_alert=True,
             )
         except Exception:
@@ -1391,6 +1407,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(on_continue, pattern=r"^continue:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
