@@ -15,7 +15,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -688,3 +688,126 @@ class ErrorNotificationDeduplicationTests(unittest.IsolatedAsyncioTestCase):
         for task in list(bot_data.get("_cleanup_tasks", set())):
             task.cancel()
         await asyncio.gather(*list(bot_data.get("_cleanup_tasks", set())), return_exceptions=True)
+
+
+class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
+    class FakeCallback:
+        def __init__(self, data, message):
+            self.data = data
+            self.message = message
+            self.answers = []
+
+        async def answer(self, text=None, show_alert=False):
+            self.answers.append((text, show_alert))
+
+    class FakePicker:
+        def __init__(self):
+            self.chat_id = 123
+            self.message_id = 456
+            self.text = "🎵 Выбери трек:"
+            self.reply_markup = None
+
+        async def edit_text(self, *args, **kwargs):
+            return None
+
+    async def test_expired_picker_shows_telegram_alert_instead_of_chat_message(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:expired-token:0", picker)
+        bot_data = {"music_searches": {}}
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        await on_pick(update, ctx)
+
+        self.assertEqual(
+            callback.answers,
+            [("❗ Время истекло. Выполните новый поиск.", True)],
+        )
+
+    async def test_failed_music_delivery_shows_distinct_telegram_alert(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": set(),
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        async def failed_process(*args, **kwargs):
+            return False
+
+        async def no_animation(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        with patch("main.process", side_effect=failed_process), patch(
+            "main._animate_picker", side_effect=no_animation
+        ):
+            await on_pick(update, ctx)
+
+        self.assertEqual(
+            callback.answers,
+            [("⚠️ Не удалось отправить музыку. Попробуйте ещё раз.", True)],
+        )
+
+
+    async def test_failed_callback_alert_falls_back_to_temporary_chat_message(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+
+        async def expired_callback_answer(*args, **kwargs):
+            raise RuntimeError("callback query expired")
+
+        callback.answer = expired_callback_answer
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": set(),
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        async def failed_process(*args, **kwargs):
+            return False
+
+        async def no_animation(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        with patch("main.process", side_effect=failed_process), patch(
+            "main._animate_picker", side_effect=no_animation
+        ), patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
+            await on_pick(update, ctx)
+
+        notify.assert_awaited_once_with(
+            ctx,
+            123,
+            "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
+        )
