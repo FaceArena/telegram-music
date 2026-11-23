@@ -108,7 +108,7 @@ class TopMusicRankingTests(unittest.TestCase):
             for index in range(12):
                 for user_id in range(index + 1):
                     self.cache.record_download(
-                        f"video_{index:02d}", f"Song {index}", "Artist", user_id=user_id + 1000
+                        f"video_{index:02d}", f"Song {index}", "Artist", user_id=1000 + index * 20 + user_id
                     )
             rows = self.cache.top_downloads(days=7, limit=10)
 
