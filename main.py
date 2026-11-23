@@ -589,6 +589,23 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         await send_generic_error(ctx, chat_id)
 
 
+def _record_successful_delivery(cache, video_id, file_id, title, performer, duration, user_id):
+    """Persist cache and ranking independently after Telegram confirms delivery."""
+    if not cache or not video_id:
+        return
+    if file_id:
+        try:
+            cache.put_track(video_id, file_id, title, performer, duration)
+        except Exception as exc:
+            log.warning("Не удалось сохранить file_id в кэш: %s", exc)
+    try:
+        cache.record_download(
+            video_id, title, performer, duration, user_id=user_id
+        )
+    except Exception as exc:
+        log.warning("Не удалось записать скачивание в рейтинг: %s", exc)
+
+
 async def process(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -611,13 +628,16 @@ async def process(
                     chat_id=chat_id, audio=row[0], title=row[1], performer=row[2],
                     duration=row[3], read_timeout=60, write_timeout=60,
                 )
-                if CACHE:
-                    CACHE.record_download(vid, row[1], row[2], row[3], user_id=update.effective_user.id if update.effective_user else None)
-                log.info("КЭШ: трек %s отправлен по file_id", vid)
-                return
             except Exception as exc:
                 log.warning("КЭШ: file_id для %s не сработал (%s), качаю заново", vid, str(exc)[:100])
                 CACHE.drop_track(vid)
+            else:
+                _record_successful_delivery(
+                    CACHE, vid, None, row[1], row[2], row[3],
+                    update.effective_user.id if update.effective_user else None,
+                )
+                log.info("КЭШ: трек %s отправлен по file_id", vid)
+                return
 
     async with DL_LOCK:
         if _last_finish and MAX_DELAY > 0:
@@ -681,18 +701,15 @@ async def process(
                     connect_timeout=30,
                     pool_timeout=30,
                 )
-            try:
-                successful_video_id = vid or info.get("id")
-                title = info.get("track") or info.get("title")
-                performer = info.get("artist") or info.get("uploader")
-                duration = int(info.get("duration") or 0) or None
-                if CACHE and sent and sent.audio and successful_video_id:
-                    CACHE.put_track(
-                        successful_video_id, sent.audio.file_id, title, performer, duration,
-                    )
-                    CACHE.record_download(successful_video_id, title, performer, duration, user_id=update.effective_user.id if update.effective_user else None)
-            except Exception as exc:
-                log.warning("Не удалось сохранить в кэш: %s", exc)
+            successful_video_id = vid or info.get("id")
+            title = info.get("track") or info.get("title")
+            performer = info.get("artist") or info.get("uploader")
+            duration = int(info.get("duration") or 0) or None
+            if CACHE and sent and sent.audio and successful_video_id:
+                _record_successful_delivery(
+                    CACHE, successful_video_id, sent.audio.file_id, title, performer,
+                    duration, update.effective_user.id if update.effective_user else None,
+                )
             log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
                      time.monotonic() - upload_started, path.stat().st_size / (1024 * 1024))
         except Exception:

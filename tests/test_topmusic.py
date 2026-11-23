@@ -10,7 +10,7 @@ from unittest.mock import patch
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _release_processing, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _record_successful_delivery, _release_processing, is_youtube_url, schedule_prefetch, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -327,6 +327,69 @@ class SearchCacheRecoveryTests(unittest.TestCase):
         self.cache.put_search("valid query", expected)
 
         self.assertEqual(self.cache.get_search("valid query"), expected)
+
+
+class DeliveryPersistenceTests(unittest.TestCase):
+    def test_track_cache_failure_does_not_skip_ranking_record(self):
+        class CacheWithTrackWriteFailure:
+            def __init__(self):
+                self.recorded = []
+
+            def put_track(self, *args):
+                raise OSError("disk full")
+
+            def record_download(self, *args, **kwargs):
+                self.recorded.append((args, kwargs))
+
+        cache = CacheWithTrackWriteFailure()
+
+        _record_successful_delivery(
+            cache, "video_A123", "telegram-file-id", "Song", "Artist", 180, 101
+        )
+
+        self.assertEqual(len(cache.recorded), 1)
+        self.assertEqual(cache.recorded[0][0][0], "video_A123")
+        self.assertEqual(cache.recorded[0][1]["user_id"], 101)
+
+    def test_ranking_write_failure_does_not_raise_after_delivery(self):
+        class CacheWithRankingFailure:
+            def __init__(self):
+                self.track_saved = False
+
+            def put_track(self, *args):
+                self.track_saved = True
+
+            def record_download(self, *args, **kwargs):
+                raise OSError("database unavailable")
+
+        cache = CacheWithRankingFailure()
+
+        _record_successful_delivery(
+            cache, "video_A123", "telegram-file-id", "Song", "Artist", 180, 101
+        )
+
+        self.assertTrue(cache.track_saved)
+
+    def test_cached_delivery_records_vote_without_rewriting_file_id(self):
+        class CacheForCachedDelivery:
+            def __init__(self):
+                self.track_writes = 0
+                self.downloads = 0
+
+            def put_track(self, *args):
+                self.track_writes += 1
+
+            def record_download(self, *args, **kwargs):
+                self.downloads += 1
+
+        cache = CacheForCachedDelivery()
+
+        _record_successful_delivery(
+            cache, "video_A123", None, "Song", "Artist", 180, 101
+        )
+
+        self.assertEqual(cache.track_writes, 0)
+        self.assertEqual(cache.downloads, 1)
 
 
 if __name__ == "__main__":
