@@ -749,17 +749,6 @@ async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines))
 
 
-async def cmd_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(ctx.args).strip()
-    if not query:
-        await update.effective_message.reply_text("Напиши так: /music Кино — Группа крови")
-        return
-    if URL_RE.fullmatch(query):
-        await process(update, ctx, query[:500])
-    else:
-        await show_search(update, ctx, query[:200])
-
-
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text or (update.effective_user and update.effective_user.is_bot):
@@ -801,7 +790,6 @@ async def update_ytdlp(ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
-        BotCommand("music", "Найти музыку"),
         BotCommand("topmusic", "🎧 Топ музыки | Top music"),
     ])
 
@@ -815,7 +803,6 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("music", cmd_music))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
