@@ -15,7 +15,7 @@ from telegram.error import BadRequest
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, update_ytdlp  # noqa: E402
+from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -631,3 +631,60 @@ class RankingTieBreakTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ErrorNotificationDeduplicationTests(unittest.IsolatedAsyncioTestCase):
+    def make_context(self):
+        class FakeBot:
+            def __init__(self):
+                self.sent = []
+                self.deleted = []
+
+            async def send_message(self, chat_id, text):
+                message = type("Message", (), {
+                    "chat_id": chat_id,
+                    "message_id": len(self.sent) + 1,
+                })()
+                self.sent.append((chat_id, text, message))
+                return message
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+
+        bot = FakeBot()
+        bot_data = {}
+        ctx = type("Context", (), {
+            "bot": bot,
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        return ctx, bot, bot_data
+
+    async def test_burst_of_same_chat_errors_sends_only_one_emoji_notification(self):
+        ctx, bot, bot_data = self.make_context()
+
+        await asyncio.gather(*[
+            send_generic_error(ctx, -100123, "⚠️ Произошла ошибка.")
+            for _ in range(20)
+        ])
+
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(bot.sent[0][1], "⚠️ Произошла ошибка.")
+        tasks = bot_data.get("_cleanup_tasks", set())
+        self.assertEqual(len(tasks), 1)
+        for task in list(tasks):
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_new_error_can_be_sent_after_previous_notification_expires(self):
+        ctx, bot, bot_data = self.make_context()
+
+        with patch("main.ERROR_NOTIFICATION_TTL", 0.01):
+            await send_generic_error(ctx, -100123, "❌ Не удалось загрузить.")
+            await asyncio.sleep(0.04)
+            await send_generic_error(ctx, -100123, "❌ Не удалось загрузить.")
+
+        self.assertEqual(len(bot.sent), 2)
+        self.assertEqual(bot.deleted, [(-100123, 1)])
+        for task in list(bot_data.get("_cleanup_tasks", set())):
+            task.cancel()
+        await asyncio.gather(*list(bot_data.get("_cleanup_tasks", set())), return_exceptions=True)
