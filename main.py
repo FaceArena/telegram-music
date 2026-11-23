@@ -759,7 +759,8 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
     try:
         nq = norm_query(query)
         results = _safe_cache_call(CACHE, "get_search", nq)
-        if results:
+        cache_hit = bool(results)
+        if cache_hit:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
         else:
             async with SEARCH_SEMAPHORE:
@@ -770,7 +771,7 @@ async def show_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str
         # Rank on both cache hits and fresh searches so existing 6-hour cache entries
         # immediately benefit from ranking changes without a schema migration.
         results = rank_search_results(query, results)
-        if results and not _safe_cache_call(CACHE, "get_search", nq):
+        if results and not cache_hit:
             _safe_cache_call(CACHE, "put_search", nq, results)
         if not results:
             await send_generic_error(ctx, chat_id)
