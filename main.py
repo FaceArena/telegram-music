@@ -892,7 +892,13 @@ async def _send_audio_limited(bot, *, on_started=None, **kwargs):
                 audio = kwargs.get("audio")
                 if hasattr(audio, "seek"):
                     audio.seek(0)
-                delay = max(0.0, float(exc.retry_after))
+                retry_after = exc.retry_after
+                delay = max(
+                    0.0,
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after),
+                )
                 log.warning(
                     "Telegram ограничил отправку аудио; повтор %d/2 через %.1f с",
                     attempt + 1, delay,
@@ -1169,7 +1175,7 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if VIDEO_LOCK.locked():
         await send_generic_error(
             ctx, chat.id,
-            "⚠️ Сейчас слишком много запросов на распознавание видео. Попробуй ещё раз через минуту."
+            "⚠️ Сейчас уже обрабатываются два видео. Попробуй ещё раз чуть позже."
         )
         return
 
@@ -1243,6 +1249,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     token = None
     picker = None
     anim = None
+    claimed = False
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
@@ -1274,6 +1281,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not _claim_processing(processing_tokens, token):
             await callback.answer()
             return
+        claimed = True
 
         # Acknowledge the Telegram callback before any download/network wait.
         # Telegram expires unanswered callback queries while long-running work continues.
@@ -1301,7 +1309,12 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
             )
     except (ValueError, AttributeError, TypeError):
-        if callback:
+        if claimed and picker:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
+            )
+        elif callback:
             try:
                 await callback.answer(
                     "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
@@ -1327,7 +1340,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
             except Exception as exc:
                 log.debug("Не удалось восстановить окно выбора: %s", exc)
-        if processing_tokens is not None and token is not None:
+        if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
 
 
