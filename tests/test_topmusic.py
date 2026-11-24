@@ -11,11 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from telegram.error import BadRequest, RetryAfter
+from telegram.ext import Application
 
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -1013,3 +1014,17 @@ class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.calls, 2)
         self.assertEqual(audio.positions, [0])
         sleep.assert_awaited_once_with(0.51)
+
+
+class BoundedUpdateQueueTests(unittest.TestCase):
+    def test_application_uses_bounded_update_queue_and_explicit_concurrency(self):
+        app = (
+            Application.builder()
+            .token("123456:TEST_TOKEN")
+            .update_queue(asyncio.Queue(maxsize=MAX_PENDING_UPDATES))
+            .concurrent_updates(MAX_CONCURRENT_UPDATES)
+            .build()
+        )
+
+        self.assertEqual(app.update_queue.maxsize, 128)
+        self.assertEqual(app.update_processor.max_concurrent_updates, 32)
