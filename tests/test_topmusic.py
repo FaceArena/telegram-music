@@ -18,7 +18,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_download_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -704,232 +704,175 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             self.answers.append((text, show_alert))
 
     class FakePicker:
-        def __init__(self):
+        next_id = 700
+
+        def __init__(self, message_id=456, text="🎵 Выбери трек:", reply_markup=None):
             self.chat_id = 123
-            self.message_id = 456
-            self.text = "🎵 Выбери трек:"
-            self.reply_markup = None
+            self.message_id = message_id
+            self.text = text
+            self.reply_markup = reply_markup
+            self.deleted = False
+            self.replies = []
 
         async def edit_text(self, text, reply_markup=None):
             self.text = text
             self.reply_markup = reply_markup
             return self
 
-    async def test_expired_picker_shows_telegram_alert_instead_of_chat_message(self):
-        picker = self.FakePicker()
-        callback = self.FakeCallback("pick:expired-token:0", picker)
-        bot_data = {"music_searches": {}}
+        async def reply_text(self, text, reply_markup=None):
+            type(self).next_id += 1
+            message = type(self)(type(self).next_id, text, reply_markup)
+            self.replies.append(message)
+            return message
+
+        async def delete(self):
+            self.deleted = True
+
+    def make_context(self, state):
+        bot_data = {
+            "music_searches": {"live-token": state} if state else {},
+            "music_processing_tokens": set(),
+        }
         ctx = type("Context", (), {
             "application": type("Application", (), {"bot_data": bot_data})(),
         })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
+        return ctx, bot_data
+
+    async def test_expired_picker_shows_telegram_alert(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:expired-token:0", picker)
+        ctx, _ = self.make_context(None)
+        update = type("Update", (), {"callback_query": callback})()
 
         await on_pick(update, ctx)
 
-        self.assertEqual(
-            callback.answers,
-            [("❗ Время истекло. Выполните новый поиск.", True)],
-        )
+        self.assertEqual(callback.answers, [("❗ Время истекло. Выполните новый поиск.", True)])
 
-    async def test_failed_bass_delivery_is_reported_after_callback_ack(self):
+    async def test_track_pick_keeps_original_ten_results_message_unchanged(self):
         picker = self.FakePicker()
-        picker.text = "🔊 Выбери обработку баса"
-        callback = self.FakeCallback("bass:live-token:0:boost", picker)
-        bot_data = {
-            "music_searches": {
-                "live-token": {
-                    "chat_id": 123,
-                    "message_id": 456,
-                    "created": time.time(),
-                    "stage": "bass",
-                    "selected_index": 0,
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
-                }
-            },
-            "music_processing_tokens": set(),
-        }
-        ctx = type("Context", (), {
-            "application": type("Application", (), {"bot_data": bot_data})(),
-        })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
-
-        async def failed_process(*args, **kwargs):
-            self.assertEqual(callback.answers, [(None, False)])
-            self.assertEqual(kwargs["bass_preset"], "boost")
-            return False
-
-        with patch("main.process", side_effect=failed_process), patch(
-            "main.send_generic_error", new_callable=unittest.mock.AsyncMock
-        ) as notify, patch(
-            "main._animate_picker", new_callable=unittest.mock.AsyncMock
-        ) as animation:
-            await on_bass_pick(update, ctx)
-
-        self.assertEqual(callback.answers, [(None, False)])
-        notify.assert_awaited_once_with(
-            ctx, 123,
-            "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
-        )
-        animation.assert_not_called()
-
-
-    async def test_callback_ack_failure_still_displays_bass_menu(self):
-        picker = self.FakePicker()
+        original_text = picker.text
+        original_markup = object()
+        picker.reply_markup = original_markup
         callback = self.FakeCallback("pick:live-token:0", picker)
-
-        async def expired_callback_answer(*args, **kwargs):
-            raise RuntimeError("callback query expired")
-
-        callback.answer = expired_callback_answer
-        bot_data = {
-            "music_searches": {
-                "live-token": {
-                    "chat_id": 123,
-                    "message_id": 456,
-                    "created": time.time(),
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title":"Test song"}],
-                }
-            },
-            "music_processing_tokens": set(),
+        state = {
+            "chat_id": 123,
+            "message_id": 456,
+            "created": time.time(),
+            "results": [
+                {"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}
+            ],
         }
-        ctx = type("Context", (), {
-            "application": type("Application", (), {"bot_data": bot_data})(),
-        })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
+        ctx, bot_data = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
 
-        with patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
+        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock:
             await on_pick(update, ctx)
 
-        self.assertEqual(bot_data["music_searches"]["live-token"]["stage"], "bass")
-        self.assertIn("Test song", picker.text)
-        self.assertEqual(len(picker.reply_markup.inline_keyboard), 2)
-        notify.assert_not_awaited()
-
-    async def test_track_pick_displays_bass_menu_without_downloading(self):
-        picker = self.FakePicker()
-        callback = self.FakeCallback("pick:live-token:0", picker)
-        bot_data = {
-            "music_searches": {
-                "live-token": {
-                    "chat_id": 123,
-                    "message_id": 456,
-                    "created": time.time(),
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title":"Test song"}],
-                }
-            },
-            "music_processing_tokens": set(),
-        }
-        ctx = type("Context", (), {
-            "application": type("Application", (), {"bot_data": bot_data})(),
-        })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
-
-        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock, patch(
-            "main._animate_picker", new_callable=unittest.mock.AsyncMock
-        ) as animation:
-            await on_pick(update, ctx)
-
+        self.assertEqual(picker.text, original_text)
+        self.assertIs(picker.reply_markup, original_markup)
+        self.assertEqual(len(picker.replies), 1)
+        prompt = picker.replies[0]
+        self.assertIn("Test song", prompt.text)
+        self.assertEqual(state["stage"], "bass")
+        self.assertEqual(state["selected_index"], 0)
+        self.assertEqual(state["bass_message_id"], prompt.message_id)
         self.assertEqual(callback.answers, [(None, False)])
-        self.assertIn("Test song", picker.text)
-        self.assertEqual(bot_data["music_searches"]["live-token"]["stage"], "bass")
-        self.assertEqual(bot_data["music_searches"]["live-token"]["selected_index"], 0)
-        self.assertEqual(
-            [b.callback_data.rsplit(":", 1)[-1] for row in picker.reply_markup.inline_keyboard for b in row],
-            ["original", "bass", "boost", "extreme"],
-        )
         process_mock.assert_not_awaited()
-        animation.assert_not_awaited()
-        self.assertNotIn("live-token", bot_data["music_processing_tokens"])
 
-    async def test_spinner_starts_only_after_bass_process_admits_work(self):
-        picker = self.FakePicker()
-        picker.text = "🔊 Выбери обработку баса"
-        callback = self.FakeCallback("bass:live-token:0:boost", picker)
-        bot_data = {
-            "music_searches": {
-                "live-token": {
-                    "chat_id": 123,
-                    "message_id": 456,
-                    "created": time.time(),
-                    "stage": "bass",
-                    "selected_index": 0,
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
-                }
-            },
-            "music_processing_tokens": set(),
+    async def test_bass_choice_only_prepares_download_confirmation(self):
+        original = self.FakePicker()
+        prompt = self.FakePicker(789, "🎵 Choose bass")
+        callback = self.FakeCallback("bass:live-token:0:boost", prompt)
+        state = {
+            "chat_id": 123,
+            "message_id": original.message_id,
+            "bass_message_id": prompt.message_id,
+            "created": time.time(),
+            "stage": "bass",
+            "selected_index": 0,
+            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
         }
-        ctx = type("Context", (), {
-            "application": type("Application", (), {"bot_data": bot_data})(),
-        })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
-        animation_started = asyncio.Event()
+        ctx, _ = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
 
-        async def fake_animation(*args, **kwargs):
-            animation_started.set()
-            await asyncio.sleep(10)
-
-        async def admitted_process(*args, **kwargs):
-            self.assertEqual(callback.answers, [(None, False)])
-            self.assertEqual(kwargs["bass_preset"], "boost")
-            self.assertFalse(animation_started.is_set())
-            await kwargs["on_started"]()
-            await asyncio.sleep(0)
-            self.assertTrue(animation_started.is_set())
-            return True
-
-        with patch("main.process", side_effect=admitted_process), patch(
-            "main._animate_picker", side_effect=fake_animation
-        ):
+        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock:
             await on_bass_pick(update, ctx)
 
-        self.assertTrue(animation_started.is_set())
+        self.assertEqual(state["selected_preset"], "boost")
+        self.assertIn("Test song", prompt.text)
+        self.assertIn("🔥", prompt.text)
+        buttons = [b for row in prompt.reply_markup.inline_keyboard for b in row]
+        self.assertTrue(any(b.callback_data == "download:live-token" for b in buttons))
+        self.assertTrue(any(b.callback_data == "basschange:live-token" for b in buttons))
+        process_mock.assert_not_awaited()
+
+    async def test_download_starts_only_after_explicit_confirmation(self):
+        prompt = self.FakePicker(789, "Ready to download")
+        callback = self.FakeCallback("download:live-token", prompt)
+        state = {
+            "chat_id": 123,
+            "message_id": 456,
+            "bass_message_id": prompt.message_id,
+            "created": time.time(),
+            "stage": "bass",
+            "selected_index": 0,
+            "selected_preset": "extreme",
+            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
+        }
+        ctx, bot_data = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
+
+        with patch("main.process", new_callable=unittest.mock.AsyncMock, return_value=True) as process_mock:
+            await on_download_pick(update, ctx)
+
+        process_mock.assert_awaited_once()
+        self.assertEqual(process_mock.await_args.kwargs["bass_preset"], "extreme")
+        self.assertEqual(callback.answers, [(None, False)])
+        self.assertIn("Трек отправлен", prompt.text)
         self.assertNotIn("live-token", bot_data["music_processing_tokens"])
 
+    async def test_back_returns_to_original_picker_without_new_search(self):
+        prompt = self.FakePicker(789, "Bass settings")
+        callback = self.FakeCallback("back:live-token", prompt)
+        state = {
+            "chat_id": 123,
+            "message_id": 456,
+            "bass_message_id": prompt.message_id,
+            "created": time.time(),
+            "stage": "bass",
+            "selected_index": 2,
+            "selected_preset": "boost",
+            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
+        }
+        ctx, _ = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
 
+        await on_picker_back(update, ctx)
+
+        self.assertTrue(prompt.deleted)
+        self.assertEqual(state["stage"], "select")
+        self.assertIsNone(state["selected_index"])
+        self.assertIsNone(state["selected_preset"])
+        self.assertIsNone(state["bass_message_id"])
+        self.assertEqual(state["message_id"], 456)
 
     async def test_duplicate_picker_click_does_not_release_existing_claim(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
-        processing_tokens = {"live-token"}
-        bot_data = {
-            "music_searches": {
-                "live-token": {
-                    "chat_id": 123,
-                    "message_id": 456,
-                    "created": time.time(),
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
-                }
-            },
-            "music_processing_tokens": processing_tokens,
+        state = {
+            "chat_id": 123,
+            "message_id": 456,
+            "created": time.time(),
+            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
         }
-        ctx = type("Context", (), {
-            "application": type("Application", (), {"bot_data": bot_data})(),
-        })()
-        update = type("Update", (), {
-            "callback_query": callback,
-            "effective_chat": type("Chat", (), {"id": 123})(),
-        })()
+        ctx, bot_data = self.make_context(state)
+        bot_data["music_processing_tokens"].add("live-token")
+        update = type("Update", (), {"callback_query": callback})()
 
         await on_pick(update, ctx)
 
-        self.assertEqual(callback.answers, [(None, False)])
-        self.assertIn("live-token", processing_tokens)
-
+        self.assertIn("live-token", bot_data["music_processing_tokens"])
+        self.assertEqual(picker.replies, [])
 
 
 class SearchRelevanceRankingTests(unittest.TestCase):
@@ -1226,11 +1169,12 @@ class BassProcessingTests(unittest.TestCase):
     def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
         markup = build_bass_keyboard("0123456789abcdef", 9)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 4)
+        self.assertEqual(len(buttons), 5)
         self.assertEqual(
-            [button.callback_data.rsplit(":", 1)[-1] for button in buttons],
+            [button.callback_data.rsplit(":", 1)[-1] for button in buttons[:4]],
             ["original", "bass", "boost", "extreme"],
         )
+        self.assertEqual(buttons[4].callback_data, "back:0123456789abcdef")
         self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
 
     def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
