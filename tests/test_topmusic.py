@@ -9,7 +9,6 @@ import time
 import tempfile
 import unittest
 
-import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
