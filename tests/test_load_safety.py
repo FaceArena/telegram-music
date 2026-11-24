@@ -97,7 +97,7 @@ class SyntheticLoadSafetyTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*workers, return_exceptions=True)
 
         self.assertEqual(processed, 1000)
-        self.assertLessEqual(queue_peak, MAX_PENDING_UPDATES)
+        self.assertEqual(queue_peak, MAX_PENDING_UPDATES)
         self.assertLessEqual(peak["handlers"], MAX_CONCURRENT_UPDATES)
         self.assertLessEqual(peak["search"], MAX_PARALLEL_SEARCH)
         self.assertLessEqual(peak["downloads"], MAX_PARALLEL_DL)
