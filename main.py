@@ -1452,8 +1452,8 @@ def build_audio_keyboard(token: str, index: int, label: str = "🔊 Добави
 
 def build_bass_keyboard(token: str, index: int) -> InlineKeyboardMarkup:
     options = [
-        ("🔥 Bass", "bass"),
         ("🔊 Усилить низкие частоты", "low_freq"),
+        ("🔥 Bass", "bass"),
     ]
     buttons = [
         InlineKeyboardButton(label, callback_data=f"bassapply:{token}:{index}:{preset}")
