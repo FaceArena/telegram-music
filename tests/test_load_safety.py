@@ -4,7 +4,10 @@ This deliberately uses fake work and never calls Telegram, YouTube, AudD or FFmp
 It validates queue/semaphore bounds, not real-world capacity or end-to-end latency.
 """
 import asyncio
+import os
 import unittest
+
+os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
 from main import (
     MAX_CONCURRENT_UPDATES,
