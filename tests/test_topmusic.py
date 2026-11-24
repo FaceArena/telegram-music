@@ -18,7 +18,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -1165,3 +1165,59 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cache_hit(search=%.1f%%", message)
         self.assertEqual(args[7], 75.0)
         self.assertIn("rss_peak_mb=%.1f", message)
+
+
+class BassProcessingTests(unittest.TestCase):
+    def test_presets_map_to_real_low_frequency_filters(self):
+        self.assertIsNone(bass_filter_for_preset("original"))
+        self.assertIn("bass=g=5.0:f=90", bass_filter_for_preset("bass"))
+        self.assertIn("bass=g=9.0:f=90", bass_filter_for_preset("boost"))
+        self.assertIn("bass=g=12.0:f=90", bass_filter_for_preset("extreme"))
+        self.assertIn("alimiter=limit=0.95", bass_filter_for_preset("extreme"))
+
+    def test_unknown_preset_is_rejected(self):
+        with self.assertRaises(ValueError):
+            bass_filter_for_preset("maximum++")
+
+    def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
+        markup = build_bass_keyboard("0123456789abcdef", 9)
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        self.assertEqual(len(buttons), 4)
+        self.assertEqual(
+            [button.callback_data.rsplit(":", 1)[-1] for button in buttons],
+            ["original", "bass", "boost", "extreme"],
+        )
+        self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
+
+    def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp3"
+            target = Path(directory) / "processed.mp3"
+            source.write_bytes(b"source-audio")
+
+            def fake_ffmpeg(command, **kwargs):
+                Path(command[-1]).write_bytes(b"processed-audio")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch("main.subprocess.run", side_effect=fake_ffmpeg) as run:
+                _apply_bass_boost(source, target, "boost")
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], "ffmpeg")
+            self.assertIn("-af", command)
+            self.assertIn("bass=g=9.0:f=90", command[command.index("-af") + 1])
+            self.assertTrue(target.is_file())
+            self.assertGreater(target.stat().st_size, 0)
+            self.assertEqual(run.call_args.kwargs["timeout"], 180)
+
+    def test_apply_bass_boost_rejects_missing_ffmpeg_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp3"
+            target = Path(directory) / "processed.mp3"
+            source.write_bytes(b"source-audio")
+            with patch(
+                "main.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stderr=""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    _apply_bass_boost(source, target, "bass")
