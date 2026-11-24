@@ -628,13 +628,8 @@ def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
         "file_access_retries": 1,
         "socket_timeout": 15,
         "match_filter": match_filter_func(f"duration < {MAX_DURATION}"),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": AUDIO_FORMAT,
-            "preferredquality": AUDIO_QUALITY,
-        }],
-        # compression_level 9 — быстрее кодирует mp3 (≈на 40%) при том же качестве
-        "postprocessor_args": {"extractaudio": ["-compression_level", "9"]} if AUDIO_FORMAT == "mp3" else {},
+        # Не перекодируем здесь: единый финальный FFmpeg-кодировщик запускается
+        # один раз после загрузки для standard и Bass.
         "extractor_args": {"youtube": {"player_client": clients}},
         "js_runtimes": {"deno": {}},
     }
@@ -682,15 +677,8 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
         elif st == "finished":
             marks["dl_done"] = time.monotonic()
 
-    def _on_pp(d):
-        if d.get("status") == "started":
-            marks["pp_start"] = time.monotonic()
-        elif d.get("status") == "finished":
-            marks["pp_done"] = time.monotonic()
-
     opts["logger"] = _StageLogger()
     opts["progress_hooks"] = [_on_progress]
-    opts["postprocessor_hooks"] = [_on_pp]
     target = query if is_url else f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(opts) as ydl:
         if prefetched is not None:
@@ -700,17 +688,36 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
     end = time.monotonic()
     first = marks.get("first", t0)
     dl_done = marks.get("dl_done", first)
-    pp_start = marks.get("pp_start", dl_done)
-    pp_done = marks.get("pp_done", end)
     log.info(
-        "ТАЙМИНГ: извлечение данных %.1f с | загрузка %.1f с | ffmpeg %.1f с | всего %.1f с",
-        first - t0, dl_done - first, pp_done - pp_start, end - t0,
+        "ТАЙМИНГ: извлечение данных %.1f с | загрузка %.1f с | yt-dlp всего %.1f с",
+        first - t0, dl_done - first, end - t0,
     )
     if info and "entries" in info:
         entries = [e for e in info["entries"] if e]
         info = entries[0] if entries else None
-    files = list(workdir.glob(f"*.{AUDIO_FORMAT}"))
-    return info, (files[0] if files else None)
+
+    # Без FFmpegExtractAudio исходник сохраняет исходное расширение (webm/m4a/opus).
+    # Сначала используем точный filepath от yt-dlp, затем безопасный fallback в папке.
+    candidates = []
+    if isinstance(info, dict):
+        requested = info.get("requested_downloads") or []
+        for item in requested:
+            filepath = item.get("filepath") if isinstance(item, dict) else None
+            if filepath:
+                candidates.append(Path(filepath))
+        filepath = info.get("filepath")
+        if filepath:
+            candidates.append(Path(filepath))
+    source = next((p for p in candidates if p.is_file() and p.stat().st_size > 0), None)
+    if source is None:
+        files = [
+            p for p in workdir.iterdir()
+            if p.is_file() and p.name != "cookies.txt"
+            and not p.name.endswith((".part", ".ytdl"))
+            and p.stat().st_size > 0
+        ]
+        source = max(files, key=lambda p: p.stat().st_size) if files else None
+    return info, source
 
 
 def bass_filter_for_preset(preset: str) -> str | None:
@@ -1203,6 +1210,7 @@ async def process(
             # Finalize standard and bass variants through exactly the same encoder.
             # "original" skips the EQ filter but still gets the same 320 kbps output.
             processed_path = workdir / f"processed.{AUDIO_FORMAT}"
+            encode_started = time.monotonic()
             try:
                 if bass_preset == "original":
                     await loop.run_in_executor(
@@ -1216,6 +1224,10 @@ async def process(
             except Exception:
                 _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
                 raise
+            log.info(
+                "ТАЙМИНГ: финальное FFmpeg-кодирование (%s) %.1f с",
+                bass_preset, time.monotonic() - encode_started,
+            )
             path = processed_path
 
             if path.stat().st_size > TG_LIMIT:
