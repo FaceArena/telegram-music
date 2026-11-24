@@ -159,6 +159,7 @@ async def log_runtime_metrics(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "RUNTIME_METRICS queue=%d/%d active(search=%d process=%d video=%d picker=%d) "
         "cache_hit(search=%.1f%% track=%.1f%%) "
         "wait_p95_ms(search=%.1f download=%.1f send=%.1f) "
+        "send_p95_p99_ms(total=%.1f/%.1f api=%.1f/%.1f) "
         "latency_p95_p99_ms(search=%.1f/%.1f process=%.1f/%.1f video=%.1f/%.1f) "
         "errors(youtube_search=%d youtube_download=%d audd=%d ffmpeg=%d telegram_send=%d telegram_api=%d retry_after=%d) "
         "cpu_s=%.1f rss_peak_mb=%.1f disk_free_gb=%.2f",
@@ -169,6 +170,10 @@ async def log_runtime_metrics(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         percentile_ms("search_wait_seconds", 0.95),
         percentile_ms("download_wait_seconds", 0.95),
         percentile_ms("send_wait_seconds", 0.95),
+        percentile_ms("telegram_send_total_seconds", 0.95),
+        percentile_ms("telegram_send_total_seconds", 0.99),
+        percentile_ms("telegram_send_api_seconds", 0.95),
+        percentile_ms("telegram_send_api_seconds", 0.99),
         percentile_ms("search_latency_seconds", 0.95),
         percentile_ms("search_latency_seconds", 0.99),
         percentile_ms("process_latency_seconds", 0.95),
@@ -199,8 +204,8 @@ PREFETCH_TOP = max(0, _env_int("PREFETCH_TOP", 1))
 PREFETCH_TTL = 20 * 60
 PREFETCH_CACHE: dict = {}
 MWEB_FIRST = os.getenv("MWEB_FIRST", "1") == "1"
-# mp3 (по умолчанию) требует перекодирования в ffmpeg — это самый долгий этап на длинных треках.
-# AUDIO_FORMAT=m4a отдаёт AAC без перекодирования (почти мгновенно); Telegram его тоже проигрывает.
+# И MP3, и M4A проходят через единый финальный FFmpeg-кодировщик;
+# M4A меняет контейнер/кодек, но не отключает финальную обработку.
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mp3").strip().lower()
 if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
@@ -1060,21 +1065,58 @@ def _record_successful_delivery(cache, video_id, file_id, title, performer, dura
 
 
 async def _send_audio_limited(bot, *, on_started=None, metrics=None, **kwargs):
-    """Apply one process-wide limit and bounded retries to Telegram audio sends."""
-    wait_started = time.monotonic()
+    """Limit Telegram sends and measure queue wait, API time, and end-to-end send time."""
+    total_started = time.monotonic()
+    wait_started = total_started
+    audio = kwargs.get("audio")
+    send_kind = "file_id" if isinstance(audio, str) else "upload"
+    upload_bytes = 0
+    if send_kind == "upload":
+        audio_name = getattr(audio, "name", None)
+        if audio_name:
+            try:
+                upload_bytes = Path(audio_name).stat().st_size
+            except (OSError, TypeError, ValueError):
+                pass
+
     async with SEND_LOCK:
         _metric_observe(metrics, "send_wait_seconds", time.monotonic() - wait_started)
         if on_started is not None:
             await on_started()
+
+        api_seconds = 0.0
+        retries = 0
         for attempt in range(3):
+            api_started = time.monotonic()
             try:
-                return await bot.send_audio(**kwargs)
+                result = await bot.send_audio(**kwargs)
+                attempt_seconds = time.monotonic() - api_started
+                api_seconds += attempt_seconds
+                _metric_observe(metrics, "telegram_send_attempt_seconds", attempt_seconds)
+                total_seconds = time.monotonic() - total_started
+                _metric_observe(metrics, "telegram_send_api_seconds", api_seconds)
+                _metric_observe(metrics, "telegram_send_total_seconds", total_seconds)
+                log.info(
+                    "TELEGRAM_SEND kind=%s api_seconds=%.2f total_seconds=%.2f "
+                    "upload_mb=%.2f retries=%d",
+                    send_kind, api_seconds, total_seconds,
+                    upload_bytes / (1024 * 1024), retries,
+                )
+                return result
             except RetryAfter as exc:
+                attempt_seconds = time.monotonic() - api_started
+                api_seconds += attempt_seconds
+                _metric_observe(metrics, "telegram_send_attempt_seconds", attempt_seconds)
                 _metric_increment(metrics, "telegram_retry_after")
                 if attempt == 2:
                     _metric_increment(metrics, "telegram_send_errors")
+                    _metric_observe(metrics, "telegram_send_api_seconds", api_seconds)
+                    _metric_observe(
+                        metrics, "telegram_send_total_seconds",
+                        time.monotonic() - total_started,
+                    )
                     raise
-                audio = kwargs.get("audio")
+                retries += 1
                 if hasattr(audio, "seek"):
                     audio.seek(0)
                 retry_after = exc.retry_after
@@ -1090,7 +1132,15 @@ async def _send_audio_limited(bot, *, on_started=None, metrics=None, **kwargs):
                 )
                 await asyncio.sleep(delay + 0.5)
             except Exception:
+                attempt_seconds = time.monotonic() - api_started
+                api_seconds += attempt_seconds
+                _metric_observe(metrics, "telegram_send_attempt_seconds", attempt_seconds)
                 _metric_increment(metrics, "telegram_send_errors")
+                _metric_observe(metrics, "telegram_send_api_seconds", api_seconds)
+                _metric_observe(
+                    metrics, "telegram_send_total_seconds",
+                    time.monotonic() - total_started,
+                )
                 raise
 
 
@@ -1189,7 +1239,7 @@ async def process(
                         None, _download, query, is_url, attempt_dir, use_cookies, clients, pre
                     )
                     if path:
-                        log.info("Скачивание и конвертация завершены за %.1f с", time.monotonic() - attempt_started)
+                        log.info("Скачивание завершено за %.1f с", time.monotonic() - attempt_started)
                         break
                     if info is None:
                         last_err = "no result"
@@ -1358,7 +1408,7 @@ async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         title = clean_metadata(recognition.get("title"), 120)
         artist = clean_metadata(recognition.get("artist"), 100)
         if not title or not artist:
-            await send_generic_error(ctx, chat.id, "🎵 AudD не вернул название и исполнителя.")
+            await send_generic_error(ctx, chat.id, "🎵 Не удалось распознать название песни. Попробуй другое видео.")
             return
 
         # Reuse the normal picker: show up to 10 relevant, diversified versions
@@ -1366,8 +1416,8 @@ async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         query = f"{artist} {title}"
         await show_search(update, ctx, query, video_recognition=True)
     except httpx.TimeoutException:
-        log.warning("AudD timeout while recognizing Telegram video")
-        await send_generic_error(ctx, chat.id, "⚠️ AudD не ответил вовремя. Попробуй ещё раз.")
+        log.warning("Video music recognition timed out")
+        await send_generic_error(ctx, chat.id, "⚠️ Не удалось распознать музыку вовремя. Попробуй ещё раз.")
     except subprocess.TimeoutExpired:
         log.warning("FFmpeg timed out while extracting video audio")
         await send_generic_error(ctx, chat.id, "⚠️ Не удалось обработать видео вовремя.")
@@ -1416,7 +1466,7 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if not AUDD_API_TOKEN:
-        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео не настроено: добавь AUDD_API_TOKEN в Railway Variables.")
+        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео временно недоступно. Попробуй позже.")
         return
 
     reported_size = getattr(media, "file_size", None)
