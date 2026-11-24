@@ -879,11 +879,25 @@ def _record_successful_delivery(cache, video_id, file_id, title, performer, dura
 
 
 async def _send_audio_limited(bot, *, on_started=None, **kwargs):
-    """Apply one process-wide limit to both cached and freshly uploaded audio sends."""
+    """Apply one process-wide limit and bounded retries to Telegram audio sends."""
     async with SEND_LOCK:
         if on_started is not None:
             await on_started()
-        return await bot.send_audio(**kwargs)
+        for attempt in range(3):
+            try:
+                return await bot.send_audio(**kwargs)
+            except RetryAfter as exc:
+                if attempt == 2:
+                    raise
+                audio = kwargs.get("audio")
+                if hasattr(audio, "seek"):
+                    audio.seek(0)
+                delay = max(0.0, float(exc.retry_after))
+                log.warning(
+                    "Telegram ограничил отправку аудио; повтор %d/2 через %.1f с",
+                    attempt + 1, delay,
+                )
+                await asyncio.sleep(delay + 0.5)
 
 
 async def process(
