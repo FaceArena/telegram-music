@@ -19,7 +19,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import AUDIO_FORMAT, _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -172,7 +172,7 @@ class TopMusicRankingTests(unittest.TestCase):
         self.assertIsNone(self.cache.get_track("video_A123"))
 
     def test_old_audio_cache_entries_are_invalidated(self):
-        legacy_key = f"video_A123:{__import__('main').AUDIO_FORMAT}"
+        legacy_key = f"video_A123:{AUDIO_FORMAT}"
         with self.cache.lock:
             self.cache.db.execute(
                 "INSERT INTO tracks VALUES (?, ?, ?, ?, ?, ?)",
