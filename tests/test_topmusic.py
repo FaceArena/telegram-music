@@ -1224,6 +1224,7 @@ class BassProcessingTests(unittest.TestCase):
             self.assertEqual(command[0], "ffmpeg")
             self.assertIn("-af", command)
             self.assertIn("bass=g=5.0:f=90", command[command.index("-af") + 1])
+            self.assertEqual(command[command.index("-b:a") + 1], "320k")
             self.assertTrue(target.is_file())
             self.assertGreater(target.stat().st_size, 0)
             self.assertEqual(run.call_args.kwargs["timeout"], 180)
