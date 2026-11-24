@@ -9,6 +9,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from telegram.error import BadRequest, RetryAfter
@@ -17,7 +18,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -1079,3 +1080,69 @@ class BoundedUpdateQueueTests(unittest.TestCase):
         self.assertEqual(result, "sent")
         self.assertEqual(bot.calls, 2)
         sleep.assert_awaited_once_with(0.51)
+
+
+class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
+    def test_metric_samples_are_bounded_and_percentiles_are_stable(self):
+        bot_data = {}
+        _metric_increment(bot_data, "requests")
+        _metric_increment(bot_data, "requests", 2)
+        for value in range(250):
+            _metric_observe(bot_data, "latency", value)
+
+        metrics = bot_data["_runtime_metrics"]
+        self.assertEqual(metrics["requests"], 3)
+        self.assertEqual(len(metrics["latency"]), 200)
+        self.assertEqual(metrics["latency"][0], 50.0)
+        self.assertEqual(_percentile([0.1, 0.2, 0.3, 0.4], 0.95), 0.4)
+        self.assertEqual(_percentile([], 0.95), 0.0)
+
+    async def test_runtime_decorator_tracks_active_count_and_latency(self):
+        @ _track_runtime_metric("probe")
+        async def operation(update, ctx):
+            await asyncio.sleep(0)
+            return "ok"
+
+        ctx = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        result = await operation(None, ctx)
+
+        metrics = ctx.application.bot_data["_runtime_metrics"]
+        self.assertEqual(result, "ok")
+        self.assertEqual(metrics["probe_active"], 0)
+        self.assertEqual(len(metrics["probe_latency_seconds"]), 1)
+        self.assertGreaterEqual(metrics["probe_latency_seconds"][0], 0.0)
+
+    async def test_runtime_metrics_log_queue_cache_latency_and_resources(self):
+        metrics = {
+            "search_active": 2,
+            "process_active": 1,
+            "video_active": 0,
+            "picker_active": 1,
+            "search_cache_hits": 3,
+            "search_cache_misses": 1,
+            "search_wait_seconds": [0.01, 0.02, 0.03],
+            "search_latency_seconds": [0.1, 0.2, 0.3],
+            "process_latency_seconds": [0.4, 0.5],
+            "video_latency_seconds": [],
+        }
+        queue = SimpleNamespace(qsize=lambda: 7, maxsize=128)
+        app = SimpleNamespace(
+            bot_data={"_runtime_metrics": metrics},
+            update_queue=queue,
+        )
+        ctx = SimpleNamespace(application=app)
+        usage = SimpleNamespace(ru_maxrss=1024, ru_utime=1.5, ru_stime=0.5)
+
+        with patch("main.CACHE", None), patch(
+            "main.resource.getrusage", return_value=usage
+        ), patch(
+            "main.shutil.disk_usage",
+            return_value=SimpleNamespace(free=2 * 1024 ** 3),
+        ), patch("main.log.info") as log_info:
+            await log_runtime_metrics(ctx)
+
+        log_info.assert_called_once()
+        message = log_info.call_args.args[0]
+        self.assertIn("queue=7/128", message)
+        self.assertIn("cache_hit(search=75.0%", message)
+        self.assertIn("rss_peak_mb=%.1f", message)
