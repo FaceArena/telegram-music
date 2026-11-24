@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import random
+import resource
 import re
 import json
 import shutil
@@ -17,6 +18,7 @@ import time
 import unicodedata
 import secrets
 from pathlib import Path
+from functools import wraps
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
@@ -68,6 +70,116 @@ def _env_float(name: str, default: float, minimum: float | None = None) -> float
         log.warning("Недопустимое значение %s=%r; использую %s", name, raw, default)
         return default
     return value
+
+
+def _metric_increment(bot_data: dict | None, key: str, amount: int = 1) -> None:
+    if not isinstance(bot_data, dict):
+        return
+    metrics = bot_data.setdefault("_runtime_metrics", {})
+    metrics[key] = int(metrics.get(key, 0)) + amount
+
+
+def _metric_observe(bot_data: dict | None, key: str, value: float, limit: int = 200) -> None:
+    if not isinstance(bot_data, dict):
+        return
+    metrics = bot_data.setdefault("_runtime_metrics", {})
+    samples = metrics.setdefault(key, [])
+    samples.append(float(value))
+    if len(samples) > limit:
+        del samples[:-limit]
+
+
+def _percentile(samples: list[float], percentile: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, max(0, math.ceil((len(ordered) - 1) * percentile)))
+    return ordered[index]
+
+
+def _track_runtime_metric(name: str):
+    def decorator(func):
+        @wraps(func)
+        async def wrapped(*args, **kwargs):
+            ctx = args[1] if len(args) > 1 else kwargs.get("ctx")
+            application = getattr(ctx, "application", None)
+            bot_data = getattr(application, "bot_data", None)
+            if not isinstance(bot_data, dict):
+                return await func(*args, **kwargs)
+
+            metrics = bot_data.setdefault("_runtime_metrics", {})
+            active_key = name + "_active"
+            metrics[active_key] = metrics.get(active_key, 0) + 1
+            started = time.monotonic()
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                metrics[active_key] = max(0, metrics.get(active_key, 1) - 1)
+                _metric_observe(
+                    bot_data, name + "_latency_seconds", time.monotonic() - started
+                )
+
+        return wrapped
+    return decorator
+
+
+async def log_runtime_metrics(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Emit a bounded rolling snapshot; no external metrics service is required."""
+    app = ctx.application
+    bot_data = app.bot_data
+    metrics = bot_data.get("_runtime_metrics", {})
+    update_queue = app.update_queue
+    search_hits = metrics.get("search_cache_hits", 0)
+    search_misses = metrics.get("search_cache_misses", 0)
+    track_hits = metrics.get("track_cache_hits", 0)
+    track_misses = metrics.get("track_cache_misses", 0)
+    search_total = search_hits + search_misses
+    track_total = track_hits + track_misses
+    search_hit_rate = 100.0 * search_hits / search_total if search_total else 0.0
+    track_hit_rate = 100.0 * track_hits / track_total if track_total else 0.0
+
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_peak_mb = usage.ru_maxrss / 1024
+        cpu_seconds = usage.ru_utime + usage.ru_stime
+    except Exception:
+        rss_peak_mb = 0.0
+        cpu_seconds = 0.0
+    try:
+        disk_path = CACHE.path.parent if CACHE else Path(tempfile.gettempdir())
+        disk_free_gb = shutil.disk_usage(disk_path).free / (1024 ** 3)
+    except Exception:
+        disk_free_gb = 0.0
+
+    def percentile_ms(key, percentile):
+        return _percentile(metrics.get(key, []), percentile) * 1000
+
+    log.info(
+        "RUNTIME_METRICS queue=%d/%d active(search=%d process=%d video=%d picker=%d) "
+        "cache_hit(search=%.1f%% track=%.1f%%) "
+        "wait_p95_ms(search=%.1f download=%.1f send=%.1f) "
+        "latency_p95_p99_ms(search=%.1f/%.1f process=%.1f/%.1f video=%.1f/%.1f) "
+        "errors(youtube_search=%d youtube_download=%d audd=%d ffmpeg=%d telegram=%d retry_after=%d) "
+        "cpu_s=%.1f rss_peak_mb=%.1f disk_free_gb=%.2f",
+        update_queue.qsize(), update_queue.maxsize,
+        metrics.get("search_active", 0), metrics.get("process_active", 0),
+        metrics.get("video_active", 0), metrics.get("picker_active", 0),
+        search_hit_rate, track_hit_rate,
+        percentile_ms("search_wait_seconds", 0.95),
+        percentile_ms("download_wait_seconds", 0.95),
+        percentile_ms("send_wait_seconds", 0.95),
+        percentile_ms("search_latency_seconds", 0.95),
+        percentile_ms("search_latency_seconds", 0.99),
+        percentile_ms("process_latency_seconds", 0.95),
+        percentile_ms("process_latency_seconds", 0.99),
+        percentile_ms("video_latency_seconds", 0.95),
+        percentile_ms("video_latency_seconds", 0.99),
+        metrics.get("youtube_search_errors", 0),
+        metrics.get("youtube_download_errors", 0),
+        metrics.get("audd_errors", 0), metrics.get("ffmpeg_errors", 0),
+        metrics.get("telegram_send_errors", 0), metrics.get("telegram_retry_after", 0),
+        cpu_seconds, rss_peak_mb, disk_free_gb,
+    )
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -764,6 +876,7 @@ async def send_generic_error(
         try:
             message = await ctx.bot.send_message(chat_id=chat_id, text=text)
         except Exception:
+            _metric_increment(bot_data, "telegram_send_errors")
             log.exception("Не удалось отправить сообщение об ошибке")
             return
 
@@ -778,6 +891,7 @@ async def send_generic_error(
         task.add_done_callback(tasks.discard)
 
 
+@_track_runtime_metric("search")
 async def show_search(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -792,16 +906,30 @@ async def show_search(
         # unrelated results are filtered before presenting the same 10-item picker.
         results = None if video_recognition else _safe_cache_call(CACHE, "get_search", nq)
         cache_hit = bool(results)
+        _metric_increment(
+            ctx.application.bot_data,
+            "search_cache_hits" if cache_hit else "search_cache_misses",
+        )
         if cache_hit:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
         else:
-            async with SEARCH_SEMAPHORE:
-                loop = asyncio.get_running_loop()
-                search_started = time.monotonic()
-                results = await loop.run_in_executor(
-                    None, _search_tracks, query, 30 if video_recognition else 10
-                )
-                log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
+            search_wait_started = time.monotonic()
+            try:
+                async with SEARCH_SEMAPHORE:
+                    _metric_observe(
+                        ctx.application.bot_data,
+                        "search_wait_seconds",
+                        time.monotonic() - search_wait_started,
+                    )
+                    loop = asyncio.get_running_loop()
+                    search_started = time.monotonic()
+                    results = await loop.run_in_executor(
+                        None, _search_tracks, query, 30 if video_recognition else 10
+                    )
+                    log.info("ТАЙМИНГ: поиск %.1f с, результатов: %d", time.monotonic() - search_started, len(results))
+            except Exception:
+                _metric_increment(ctx.application.bot_data, "youtube_search_errors")
+                raise
         # Rank on both cache hits and fresh searches so existing 6-hour cache entries
         # immediately benefit from ranking changes without a schema migration.
         results = rank_search_results(query, results)
@@ -878,16 +1006,20 @@ def _record_successful_delivery(cache, video_id, file_id, title, performer, dura
         log.warning("Не удалось записать скачивание в рейтинг: %s", exc)
 
 
-async def _send_audio_limited(bot, *, on_started=None, **kwargs):
+async def _send_audio_limited(bot, *, on_started=None, metrics=None, **kwargs):
     """Apply one process-wide limit and bounded retries to Telegram audio sends."""
+    wait_started = time.monotonic()
     async with SEND_LOCK:
+        _metric_observe(metrics, "send_wait_seconds", time.monotonic() - wait_started)
         if on_started is not None:
             await on_started()
         for attempt in range(3):
             try:
                 return await bot.send_audio(**kwargs)
             except RetryAfter as exc:
+                _metric_increment(metrics, "telegram_retry_after")
                 if attempt == 2:
+                    _metric_increment(metrics, "telegram_send_errors")
                     raise
                 audio = kwargs.get("audio")
                 if hasattr(audio, "seek"):
@@ -904,8 +1036,12 @@ async def _send_audio_limited(bot, *, on_started=None, **kwargs):
                     attempt + 1, delay,
                 )
                 await asyncio.sleep(delay + 0.5)
+            except Exception:
+                _metric_increment(metrics, "telegram_send_errors")
+                raise
 
 
+@_track_runtime_metric("process")
 async def process(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -925,11 +1061,16 @@ async def process(
     vid = video_id_of(query) if is_url else None
     if vid and CACHE:
         row = _safe_cache_call(CACHE, "get_track", vid)
+        _metric_increment(
+            ctx.application.bot_data,
+            "track_cache_hits" if row else "track_cache_misses",
+        )
         if row:
             try:
                 await _send_audio_limited(
                     ctx.bot,
                     on_started=on_started,
+                    metrics=ctx.application.bot_data,
                     chat_id=chat_id, audio=row[0],
                     title=clean_metadata(row[1], 128),
                     performer=clean_metadata(row[2], 128),
@@ -953,7 +1094,13 @@ async def process(
                 log.info("КЭШ: трек %s отправлен по file_id", vid)
                 return True
 
+    download_wait_started = time.monotonic()
     async with DL_LOCK:
+        _metric_observe(
+            ctx.application.bot_data,
+            "download_wait_seconds",
+            time.monotonic() - download_wait_started,
+        )
         if _last_finish and MAX_DELAY > 0:
             wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
             if wait > 0:
@@ -992,6 +1139,7 @@ async def process(
                     last_err = "track exceeds configured duration"
                     break
                 except Exception as exc:
+                    _metric_increment(ctx.application.bot_data, "youtube_download_errors")
                     last_err = str(exc)
                     log.warning(
                         "Стратегия «%s» не сработала за %.1f с: %s",
@@ -1009,6 +1157,7 @@ async def process(
             with open(path, "rb") as audio_file:
                 sent = await _send_audio_limited(
                     ctx.bot,
+                    metrics=ctx.application.bot_data,
                     chat_id=chat_id,
                     audio=audio_file,
                     title=clean_metadata(info.get("track") or info.get("title"), 128),
@@ -1098,8 +1247,16 @@ async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             return
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _extract_video_audio_sample, video_path, audio_path)
-        recognition = await recognize_video_with_audd(audio_path)
+        try:
+            await loop.run_in_executor(None, _extract_video_audio_sample, video_path, audio_path)
+        except Exception:
+            _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
+            raise
+        try:
+            recognition = await recognize_video_with_audd(audio_path)
+        except Exception:
+            _metric_increment(ctx.application.bot_data, "audd_errors")
+            raise
         if not recognition:
             await send_generic_error(ctx, chat.id, "🎵 Не удалось распознать музыку. Попробуй видео, где музыка слышна с самого начала.")
             return
@@ -1133,6 +1290,7 @@ async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     
 
+@_track_runtime_metric("video")
 async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Recognize a track in a Telegram video and send its full YouTube audio."""
     message = update.effective_message
@@ -1243,6 +1401,7 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
     return state
 
 
+@_track_runtime_metric("picker")
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
     processing_tokens = None
@@ -1472,6 +1631,9 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(
             update_ytdlp, interval=UPDATE_EVERY_HOURS * 3600, first=UPDATE_EVERY_HOURS * 3600
+        )
+        app.job_queue.run_repeating(
+            log_runtime_metrics, interval=60, first=60, name="runtime-metrics"
         )
     log.info("yt-dlp %s, стратегий: %d, PO-provider: %s",
              yt_dlp.version.__version__, len(STRATEGIES), POT_PROVIDER_URL or "нет")
