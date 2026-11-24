@@ -1111,11 +1111,11 @@ class BassProcessingTests(unittest.TestCase):
         buttons = [button for row in markup.inline_keyboard for button in row]
         self.assertEqual(len(buttons), 2)
         self.assertEqual([button.text for button in buttons], [
-            "🔥 Bass", "🔊 Усилить низкие частоты"
+            "🔊 Усилить низкие частоты", "🔥 Bass"
         ])
         self.assertEqual(
             [button.callback_data.rsplit(":", 1)[-1] for button in buttons],
-            ["bass", "low_freq"],
+            ["low_freq", "bass"],
         )
         self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
 
