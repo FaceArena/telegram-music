@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 import json
 import base64
 import os
@@ -856,6 +857,36 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+    async def test_duplicate_picker_click_does_not_release_existing_claim(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+        processing_tokens = {"live-token"}
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": processing_tokens,
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        await on_pick(update, ctx)
+
+        self.assertEqual(callback.answers, [(None, False)])
+        self.assertIn("live-token", processing_tokens)
+
+
+
 class SearchRelevanceRankingTests(unittest.TestCase):
     def make_result(self, title, video_id):
         return {
@@ -1028,3 +1059,23 @@ class BoundedUpdateQueueTests(unittest.TestCase):
 
         self.assertEqual(app.update_queue.maxsize, 128)
         self.assertEqual(app.update_processor.max_concurrent_updates, 32)
+
+
+    async def test_retry_after_accepts_timedelta_values(self):
+        class FakeBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_audio(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RetryAfter(timedelta(seconds=0.01))
+                return "sent"
+
+        bot = FakeBot()
+        with patch("main.asyncio.sleep", new_callable=unittest.mock.AsyncMock) as sleep:
+            result = await _send_audio_limited(bot, chat_id=123, audio="cached-file-id")
+
+        self.assertEqual(result, "sent")
+        self.assertEqual(bot.calls, 2)
+        sleep.assert_awaited_once_with(0.51)
