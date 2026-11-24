@@ -759,8 +759,8 @@ def _build_sub_bass(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     if samples.ndim != 1 or sample_rate < 8000 or samples.size < sample_rate:
         raise ValueError("audio is too short for Sub Bass analysis")
 
-    frame_size = 8192
-    hop = 4096
+    frame_size = 4096
+    hop = 2048
     window = np.hanning(frame_size).astype(np.float32)
     frequencies = np.fft.rfftfreq(frame_size, 1.0 / sample_rate)
     band = np.flatnonzero((frequencies >= 32.0) & (frequencies <= 190.0))
@@ -818,7 +818,7 @@ def _build_sub_bass(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     for i in range(valid_notes.size):
         smoothed[i] = float(np.median(valid_notes[max(0, i - 1):min(valid_notes.size, i + 2)]))
 
-    sample_positions = np.arange(samples.size, dtype=np.float64)
+    sample_positions = np.arange(samples.size, dtype=np.float32)
     note_curve = np.interp(sample_positions, valid_positions, smoothed).astype(np.float32)
     level_curve = np.interp(sample_positions, positions, levels).astype(np.float32)
     gate = np.clip((level_curve - 0.00025) / 0.012, 0.0, 1.0)
@@ -826,8 +826,17 @@ def _build_sub_bass(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     smoothing = max(1, int(sample_rate * 0.012))
     kernel = np.ones(smoothing, dtype=np.float32) / smoothing
     gate = np.convolve(gate, kernel, mode="same").astype(np.float32)
-    phase = (2.0 * np.pi / sample_rate) * np.cumsum(note_curve, dtype=np.float64)
-    sub = (0.30 * gate * np.sin(phase)).astype(np.float32)
+    # Accumulate phase in short chunks to avoid a large float64 temporary on long tracks.
+    sub = np.empty(samples.size, dtype=np.float32)
+    phase = 0.0
+    chunk_size = sample_rate * 5
+    for start in range(0, samples.size, chunk_size):
+        end = min(samples.size, start + chunk_size)
+        phase_curve = phase + (2.0 * np.pi / sample_rate) * np.cumsum(
+            note_curve[start:end], dtype=np.float64
+        )
+        sub[start:end] = 0.30 * gate[start:end] * np.sin(phase_curve)
+        phase = float(np.remainder(phase_curve[-1], 2.0 * np.pi))
     if not np.isfinite(sub).all() or float(np.max(np.abs(sub))) < 0.005:
         raise RuntimeError("Не удалось сформировать басовую дорожку.")
     return sub
@@ -835,7 +844,8 @@ def _build_sub_bass(samples: np.ndarray, sample_rate: int) -> np.ndarray:
 
 def _apply_real_sub_bass(input_path: Path, output_path: Path) -> None:
     """Add a synthesized, pitch-tracked sub-bass layer without EQ-boosting the vocal."""
-    sample_rate = 22050
+    # 8 kHz is sufficient for a sub-bass layer and keeps Railway memory use bounded.
+    sample_rate = 8000
     decoded = subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
