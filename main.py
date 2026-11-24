@@ -1848,7 +1848,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             delete_start_messages_job,
             when=START_MESSAGE_TTL,
             data=payload,
-            name=f"delete-start-{update.effective_chat.id}-{message.message_id}",
         )
     else:
         # JobQueue может отсутствовать в минимальной установке PTB.
