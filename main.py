@@ -615,7 +615,7 @@ STRATEGIES = build_strategies()
 
 def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio/best",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
