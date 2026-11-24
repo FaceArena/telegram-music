@@ -19,7 +19,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -637,7 +637,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ErrorNotificationDeduplicationTests(unittest.IsolatedAsyncioTestCase):
+class ErrorNotificationTtlTests(unittest.IsolatedAsyncioTestCase):
     def make_context(self):
         class FakeBot:
             def __init__(self):
@@ -663,35 +663,36 @@ class ErrorNotificationDeduplicationTests(unittest.IsolatedAsyncioTestCase):
         })()
         return ctx, bot, bot_data
 
-    async def test_burst_of_same_chat_errors_sends_only_one_emoji_notification(self):
+    async def test_every_simultaneous_error_gets_its_own_ten_second_cleanup(self):
         ctx, bot, bot_data = self.make_context()
+        self.assertEqual(ERROR_NOTIFICATION_TTL, 10)
 
-        await asyncio.gather(*[
-            send_generic_error(ctx, -100123, "⚠️ Произошла ошибка.")
-            for _ in range(20)
-        ])
+        with patch("main.ERROR_NOTIFICATION_TTL", 0.01):
+            await asyncio.gather(*[
+                send_generic_error(ctx, -100123, f"⚠️ Ошибка {index}")
+                for index in range(5)
+            ])
+            self.assertEqual(len(bot.sent), 5)
+            await asyncio.sleep(0.04)
 
-        self.assertEqual(len(bot.sent), 1)
-        self.assertEqual(bot.sent[0][1], "⚠️ Произошла ошибка.")
-        tasks = bot_data.get("_cleanup_tasks", set())
-        self.assertEqual(len(tasks), 1)
-        for task in list(tasks):
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(
+            sorted(bot.deleted),
+            [(-100123, 1), (-100123, 2), (-100123, 3), (-100123, 4), (-100123, 5)],
+        )
+        self.assertEqual(bot_data.get("_cleanup_tasks", set()), set())
 
-    async def test_new_error_can_be_sent_after_previous_notification_expires(self):
+    async def test_a_new_error_has_an_independent_ten_second_lifetime(self):
         ctx, bot, bot_data = self.make_context()
 
         with patch("main.ERROR_NOTIFICATION_TTL", 0.01):
             await send_generic_error(ctx, -100123, "❌ Не удалось загрузить.")
-            await asyncio.sleep(0.04)
+            await asyncio.sleep(0.02)
             await send_generic_error(ctx, -100123, "❌ Не удалось загрузить.")
+            await asyncio.sleep(0.02)
 
         self.assertEqual(len(bot.sent), 2)
-        self.assertEqual(bot.deleted, [(-100123, 1)])
-        for task in list(bot_data.get("_cleanup_tasks", set())):
-            task.cancel()
-        await asyncio.gather(*list(bot_data.get("_cleanup_tasks", set())), return_exceptions=True)
+        self.assertEqual(bot.deleted, [(-100123, 1), (-100123, 2)])
+        self.assertEqual(bot_data.get("_cleanup_tasks", set()), set())
 
 
 class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
@@ -1094,24 +1095,27 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BassProcessingTests(unittest.TestCase):
-    def test_presets_map_to_real_low_frequency_filters(self):
+    def test_two_visible_presets_keep_their_previous_audio_gains(self):
         self.assertIsNone(bass_filter_for_preset("original"))
-        self.assertIn("bass=g=5.0:f=90", bass_filter_for_preset("bass"))
-        self.assertIn("bass=g=9.0:f=90", bass_filter_for_preset("boost"))
-        self.assertIn("bass=g=12.0:f=90", bass_filter_for_preset("extreme"))
-        self.assertIn("alimiter=limit=0.95", bass_filter_for_preset("extreme"))
+        self.assertIn("bass=g=12.0:f=90", bass_filter_for_preset("bass"))
+        self.assertIn("bass=g=5.0:f=90", bass_filter_for_preset("low_freq"))
+        self.assertIn("alimiter=limit=0.95", bass_filter_for_preset("bass"))
 
-    def test_unknown_preset_is_rejected(self):
-        with self.assertRaises(ValueError):
-            bass_filter_for_preset("maximum++")
+    def test_removed_presets_are_rejected(self):
+        for preset in ("boost", "extreme", "maximum++"):
+            with self.subTest(preset=preset), self.assertRaises(ValueError):
+                bass_filter_for_preset(preset)
 
-    def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
+    def test_bass_keyboard_contains_only_the_two_requested_presets(self):
         markup = build_bass_keyboard("0123456789abcdef", 9)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 4)
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual([button.text for button in buttons], [
+            "🔥 Bass", "🔊 Усилить низкие частоты"
+        ])
         self.assertEqual(
             [button.callback_data.rsplit(":", 1)[-1] for button in buttons],
-            ["original", "bass", "boost", "extreme"],
+            ["bass", "low_freq"],
         )
         self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
 
@@ -1133,12 +1137,12 @@ class BassProcessingTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stderr="")
 
             with patch("main.subprocess.run", side_effect=fake_ffmpeg) as run:
-                _apply_bass_boost(source, target, "boost")
+                _apply_bass_boost(source, target, "low_freq")
 
             command = run.call_args.args[0]
             self.assertEqual(command[0], "ffmpeg")
             self.assertIn("-af", command)
-            self.assertIn("bass=g=9.0:f=90", command[command.index("-af") + 1])
+            self.assertIn("bass=g=5.0:f=90", command[command.index("-af") + 1])
             self.assertTrue(target.is_file())
             self.assertGreater(target.stat().st_size, 0)
             self.assertEqual(run.call_args.kwargs["timeout"], 180)
