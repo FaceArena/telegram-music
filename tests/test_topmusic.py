@@ -1098,7 +1098,7 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_percentile([], 0.95), 0.0)
 
     async def test_runtime_decorator_tracks_active_count_and_latency(self):
-        @ _track_runtime_metric("probe")
+        @_track_runtime_metric("probe")
         async def operation(update, ctx):
             await asyncio.sleep(0)
             return "ok"
