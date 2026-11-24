@@ -18,7 +18,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_download_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, _build_sub_bass, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_download_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -1180,6 +1180,16 @@ class BassProcessingTests(unittest.TestCase):
         self.assertIn("bass=g=12.0:f=90", bass_filter_for_preset("extreme"))
         self.assertIn("alimiter=limit=0.95", bass_filter_for_preset("extreme"))
 
+    def test_real_sub_is_a_separate_synth_mode_not_an_eq_preset(self):
+        self.assertIsNone(bass_filter_for_preset("real_sub"))
+        sample_rate = 22050
+        t = np.arange(sample_rate * 2, dtype=np.float32) / sample_rate
+        source = (0.2 * np.sin(2 * np.pi * 55.0 * t)).astype(np.float32)
+        generated = _build_sub_bass(source, sample_rate)
+        self.assertEqual(generated.shape, source.shape)
+        self.assertGreater(float(np.max(np.abs(generated))), 0.05)
+        self.assertTrue(np.isfinite(generated).all())
+
     def test_unknown_preset_is_rejected(self):
         with self.assertRaises(ValueError):
             bass_filter_for_preset("maximum++")
@@ -1187,12 +1197,12 @@ class BassProcessingTests(unittest.TestCase):
     def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
         markup = build_bass_keyboard("0123456789abcdef", 9)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 5)
+        self.assertEqual(len(buttons), 6)
         self.assertEqual(
-            [button.callback_data.rsplit(":", 1)[-1] for button in buttons[:4]],
-            ["original", "bass", "boost", "extreme"],
+            [button.callback_data.rsplit(":", 1)[-1] for button in buttons[:5]],
+            ["original", "bass", "boost", "extreme", "real_sub"],
         )
-        self.assertEqual(buttons[4].callback_data, "back:0123456789abcdef")
+        self.assertEqual(buttons[5].callback_data, "back:0123456789abcdef")
         self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
 
     def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
