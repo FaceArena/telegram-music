@@ -1460,9 +1460,9 @@ async def _animate_picker(message, index: int):
         await asyncio.sleep(ANIM_INTERVAL)
 
 
-def build_audio_keyboard(token: str, label: str = "🔊 Добавить басс") -> InlineKeyboardMarkup:
+def build_audio_keyboard(token: str, index: int, label: str = "🔊 Добавить басс") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(label, callback_data=f"bassmenu:{token}")
+        InlineKeyboardButton(label, callback_data=f"bassmenu:{token}:{index}")
     ]])
 
 
@@ -1555,7 +1555,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             selected["url"],
             notify_errors=False,
             bass_preset="original",
-            reply_markup=build_audio_keyboard(token),
+            reply_markup=build_audio_keyboard(token, index),
         )
         if not delivered:
             data["stage"] = "select"
@@ -1582,7 +1582,8 @@ async def on_bass_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
     audio_message = callback.message if callback else None
     try:
-        _, token = callback.data.split(":")
+        _, token, raw_index = callback.data.split(":")
+        index = int(raw_index)
         if not audio_message:
             await callback.answer()
             return
@@ -1595,9 +1596,9 @@ async def on_bass_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             not data
             or data.get("stage") != "sent"
             or not audio_message.audio
-            or data.get("selected_index") is None
+            or data.get("selected_index") != index
         ):
-            await callback.answer("❗ Время выбора истекло. Выбери песню заново.", show_alert=True)
+            await callback.answer("❗ Эта кнопка уже устарела. Выбери песню заново.", show_alert=True)
             return
         await callback.answer()
         await audio_message.edit_reply_markup(
@@ -1655,7 +1656,7 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             selected["url"],
             notify_errors=False,
             bass_preset=preset,
-            reply_markup=build_audio_keyboard(token, "🎚 Изменить басс"),
+            reply_markup=build_audio_keyboard(token, index, "🎚 Изменить басс"),
         )
         if not delivered:
             await audio_message.edit_reply_markup(
