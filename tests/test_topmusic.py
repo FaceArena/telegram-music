@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 import json
 import base64
 import os
@@ -10,12 +11,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
+from telegram.ext import Application
 
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -729,7 +731,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             [("❗ Время истекло. Выполните новый поиск.", True)],
         )
 
-    async def test_failed_music_delivery_shows_distinct_telegram_alert(self):
+    async def test_failed_music_delivery_is_reported_after_early_callback_ack(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
         bot_data = {
@@ -752,23 +754,24 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         })()
 
         async def failed_process(*args, **kwargs):
+            self.assertEqual(callback.answers, [(None, False)])
             return False
 
-        async def no_animation(*args, **kwargs):
-            await asyncio.sleep(10)
-
         with patch("main.process", side_effect=failed_process), patch(
-            "main._animate_picker", side_effect=no_animation
-        ):
+            "main.send_generic_error", new_callable=unittest.mock.AsyncMock
+        ) as notify, patch(
+            "main._animate_picker", new_callable=unittest.mock.AsyncMock
+        ) as animation:
             await on_pick(update, ctx)
 
-        self.assertEqual(
-            callback.answers,
-            [("⚠️ Не удалось отправить музыку. Попробуйте ещё раз.", True)],
+        self.assertEqual(callback.answers, [(None, False)])
+        notify.assert_awaited_once_with(
+            ctx, 123, "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
         )
+        animation.assert_not_called()
 
 
-    async def test_failed_callback_alert_falls_back_to_temporary_chat_message(self):
+    async def test_callback_ack_failure_does_not_block_processing(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
 
@@ -798,12 +801,9 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         async def failed_process(*args, **kwargs):
             return False
 
-        async def no_animation(*args, **kwargs):
-            await asyncio.sleep(10)
-
         with patch("main.process", side_effect=failed_process), patch(
-            "main._animate_picker", side_effect=no_animation
-        ), patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
+            "main.send_generic_error", new_callable=unittest.mock.AsyncMock
+        ) as notify:
             await on_pick(update, ctx)
 
         notify.assert_awaited_once_with(
@@ -811,6 +811,79 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             123,
             "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
         )
+
+    async def test_spinner_starts_only_after_process_admits_work(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": set(),
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+        animation_started = asyncio.Event()
+
+        async def fake_animation(*args, **kwargs):
+            animation_started.set()
+            await asyncio.sleep(10)
+
+        async def admitted_process(*args, **kwargs):
+            self.assertEqual(callback.answers, [(None, False)])
+            self.assertFalse(animation_started.is_set())
+            await kwargs["on_started"]()
+            await asyncio.sleep(0)
+            self.assertTrue(animation_started.is_set())
+            return True
+
+        with patch("main.process", side_effect=admitted_process), patch(
+            "main._animate_picker", side_effect=fake_animation
+        ):
+            await on_pick(update, ctx)
+
+        self.assertTrue(animation_started.is_set())
+        self.assertNotIn("live-token", bot_data["music_processing_tokens"])
+
+
+
+    async def test_duplicate_picker_click_does_not_release_existing_claim(self):
+        picker = self.FakePicker()
+        callback = self.FakeCallback("pick:live-token:0", picker)
+        processing_tokens = {"live-token"}
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                }
+            },
+            "music_processing_tokens": processing_tokens,
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        await on_pick(update, ctx)
+
+        self.assertEqual(callback.answers, [(None, False)])
+        self.assertIn("live-token", processing_tokens)
 
 
 
@@ -920,3 +993,89 @@ class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].url, "https://t.me/LunaAiroll")
         self.assertIsNone(buttons[0].callback_data)
+
+
+class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_audio_sends_share_a_concurrency_limit(self):
+        active = 0
+        peak = 0
+
+        class FakeBot:
+            async def send_audio(self, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.005)
+                active -= 1
+                return "sent"
+
+        with patch("main.SEND_LOCK", asyncio.Semaphore(2)):
+            results = await asyncio.gather(*[
+                _send_audio_limited(FakeBot(), chat_id=index, audio=f"file-{index}")
+                for index in range(10)
+            ])
+
+        self.assertEqual(results, ["sent"] * 10)
+        self.assertLessEqual(peak, 2)
+
+    async def test_retry_after_rewinds_upload_file_and_retries_once(self):
+        class FakeAudio:
+            def __init__(self):
+                self.positions = []
+
+            def seek(self, position):
+                self.positions.append(position)
+
+        class FakeBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_audio(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RetryAfter(0.01)
+                return "sent"
+
+        audio = FakeAudio()
+        bot = FakeBot()
+        with patch("main.asyncio.sleep", new_callable=unittest.mock.AsyncMock) as sleep:
+            result = await _send_audio_limited(bot, chat_id=123, audio=audio)
+
+        self.assertEqual(result, "sent")
+        self.assertEqual(bot.calls, 2)
+        self.assertEqual(audio.positions, [0])
+        sleep.assert_awaited_once_with(0.51)
+
+
+class BoundedUpdateQueueTests(unittest.TestCase):
+    def test_application_uses_bounded_update_queue_and_explicit_concurrency(self):
+        app = (
+            Application.builder()
+            .token("123456:TEST_TOKEN")
+            .update_queue(asyncio.Queue(maxsize=MAX_PENDING_UPDATES))
+            .concurrent_updates(MAX_CONCURRENT_UPDATES)
+            .build()
+        )
+
+        self.assertEqual(app.update_queue.maxsize, 128)
+        self.assertEqual(app.update_processor.max_concurrent_updates, 32)
+
+
+    async def test_retry_after_accepts_timedelta_values(self):
+        class FakeBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_audio(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RetryAfter(timedelta(seconds=0.01))
+                return "sent"
+
+        bot = FakeBot()
+        with patch("main.asyncio.sleep", new_callable=unittest.mock.AsyncMock) as sleep:
+            result = await _send_audio_limited(bot, chat_id=123, audio="cached-file-id")
+
+        self.assertEqual(result, "sent")
+        self.assertEqual(bot.calls, 2)
+        sleep.assert_awaited_once_with(0.51)

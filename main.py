@@ -100,10 +100,16 @@ MAX_VIDEO_RECOGNITION_SIZE = 20 * 1024 * 1024
 CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "tv,web_embedded").split(",") if c.strip()]
 URL_RE = re.compile(r"https?://\S+")
 
-MAX_PARALLEL_DL = max(1, _env_int("MAX_PARALLEL_DL", 3))
+MAX_PARALLEL_DL = max(1, _env_int("MAX_PARALLEL_DL", 3, minimum=1))
 DL_LOCK = asyncio.Semaphore(MAX_PARALLEL_DL)
 MAX_PARALLEL_SEARCH = 3
 SEARCH_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_SEARCH)
+MAX_PARALLEL_SEND = _env_int("MAX_PARALLEL_SEND", 5, minimum=1)
+SEND_LOCK = asyncio.Semaphore(MAX_PARALLEL_SEND)
+MAX_PARALLEL_VIDEO = _env_int("MAX_PARALLEL_VIDEO", 2, minimum=1)
+VIDEO_LOCK = asyncio.Semaphore(MAX_PARALLEL_VIDEO)
+MAX_CONCURRENT_UPDATES = _env_int("MAX_CONCURRENT_UPDATES", 32, minimum=1)
+MAX_PENDING_UPDATES = _env_int("MAX_PENDING_UPDATES", 128, minimum=1)
 _last_finish = 0.0
 
 
@@ -872,12 +878,41 @@ def _record_successful_delivery(cache, video_id, file_id, title, performer, dura
         log.warning("Не удалось записать скачивание в рейтинг: %s", exc)
 
 
+async def _send_audio_limited(bot, *, on_started=None, **kwargs):
+    """Apply one process-wide limit and bounded retries to Telegram audio sends."""
+    async with SEND_LOCK:
+        if on_started is not None:
+            await on_started()
+        for attempt in range(3):
+            try:
+                return await bot.send_audio(**kwargs)
+            except RetryAfter as exc:
+                if attempt == 2:
+                    raise
+                audio = kwargs.get("audio")
+                if hasattr(audio, "seek"):
+                    audio.seek(0)
+                retry_after = exc.retry_after
+                delay = max(
+                    0.0,
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after),
+                )
+                log.warning(
+                    "Telegram ограничил отправку аудио; повтор %d/2 через %.1f с",
+                    attempt + 1, delay,
+                )
+                await asyncio.sleep(delay + 0.5)
+
+
 async def process(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     query: str,
     error_text: str = "⚠️ Произошла ошибка.",
     notify_errors: bool = True,
+    on_started=None,
 ):
     global _last_finish
     chat_id = update.effective_chat.id
@@ -892,7 +927,9 @@ async def process(
         row = _safe_cache_call(CACHE, "get_track", vid)
         if row:
             try:
-                await ctx.bot.send_audio(
+                await _send_audio_limited(
+                    ctx.bot,
+                    on_started=on_started,
                     chat_id=chat_id, audio=row[0],
                     title=clean_metadata(row[1], 128),
                     performer=clean_metadata(row[2], 128),
@@ -921,6 +958,9 @@ async def process(
             wait = _last_finish + random.uniform(MIN_DELAY, MAX_DELAY) - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
+
+        if on_started is not None:
+            await on_started()
 
         workdir = Path(tempfile.mkdtemp(prefix="dl_"))
         info = path = None
@@ -967,7 +1007,8 @@ async def process(
             info = info or {}
             upload_started = time.monotonic()
             with open(path, "rb") as audio_file:
-                sent = await ctx.bot.send_audio(
+                sent = await _send_audio_limited(
+                    ctx.bot,
                     chat_id=chat_id,
                     audio=audio_file,
                     title=clean_metadata(info.get("track") or info.get("title"), 128),
@@ -1040,45 +1081,7 @@ async def recognize_video_with_audd(audio_path: Path):
     return result if isinstance(result, dict) else None
 
 
-async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Recognize a track in a Telegram video and send its full YouTube audio."""
-    message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat or (update.effective_user and update.effective_user.is_bot):
-        return
-
-    media = message.video or message.video_note
-    filename = "telegram-video.mp4"
-    if media is None and message.document:
-        document = message.document
-        document_name = Path(document.file_name or "telegram-video.mp4").name
-        is_video = (document.mime_type or "").lower().startswith("video/") or Path(document_name).suffix.lower() in {
-            ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"
-        }
-        if not is_video:
-            return
-        media = document
-        filename = document_name
-    elif media is not None:
-        filename = Path(getattr(media, "file_name", None) or "telegram-video.mp4").name
-
-    if media is None:
-        return
-
-    if chat.type != "private" and not GROUP_REACT_ALL:
-        mentioned, _ = strip_bot_mention(message.caption or "", ctx.bot.username)
-        if not mentioned:
-            return
-
-    if not AUDD_API_TOKEN:
-        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео не настроено: добавь AUDD_API_TOKEN в Railway Variables.")
-        return
-
-    reported_size = getattr(media, "file_size", None)
-    if reported_size and reported_size > MAX_VIDEO_RECOGNITION_SIZE:
-        await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
-        return
-
+async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE, message, chat, media, filename: str):
     workdir = Path(tempfile.mkdtemp(prefix="video_recognition_"))
     progress_message = None
     try:
@@ -1127,6 +1130,57 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         shutil.rmtree(workdir, ignore_errors=True)
+
+    
+
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Recognize a track in a Telegram video and send its full YouTube audio."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or (update.effective_user and update.effective_user.is_bot):
+        return
+
+    media = message.video or message.video_note
+    filename = "telegram-video.mp4"
+    if media is None and message.document:
+        document = message.document
+        document_name = Path(document.file_name or "telegram-video.mp4").name
+        is_video = (document.mime_type or "").lower().startswith("video/") or Path(document_name).suffix.lower() in {
+            ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"
+        }
+        if not is_video:
+            return
+        media = document
+        filename = document_name
+    elif media is not None:
+        filename = Path(getattr(media, "file_name", None) or "telegram-video.mp4").name
+
+    if media is None:
+        return
+
+    if chat.type != "private" and not GROUP_REACT_ALL:
+        mentioned, _ = strip_bot_mention(message.caption or "", ctx.bot.username)
+        if not mentioned:
+            return
+
+    if not AUDD_API_TOKEN:
+        await send_generic_error(ctx, chat.id, "⚠️ Распознавание видео не настроено: добавь AUDD_API_TOKEN в Railway Variables.")
+        return
+
+    reported_size = getattr(media, "file_size", None)
+    if reported_size and reported_size > MAX_VIDEO_RECOGNITION_SIZE:
+        await send_generic_error(ctx, chat.id, "⚠️ Видео слишком большое. Максимальный размер — 20 МБ.")
+        return
+
+    if VIDEO_LOCK.locked():
+        await send_generic_error(
+            ctx, chat.id,
+            "⚠️ Сейчас уже обрабатываются два видео. Попробуй ещё раз чуть позже."
+        )
+        return
+
+    async with VIDEO_LOCK:
+        await _process_video_pipeline(update, ctx, message, chat, media, filename)
 
 
 SPINNER = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
@@ -1191,6 +1245,11 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
 
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     callback = update.callback_query
+    processing_tokens = None
+    token = None
+    picker = None
+    anim = None
+    claimed = False
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
@@ -1222,52 +1281,67 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not _claim_processing(processing_tokens, token):
             await callback.answer()
             return
+        claimed = True
 
-        anim = None
+        # Acknowledge the Telegram callback before any download/network wait.
+        # Telegram expires unanswered callback queries while long-running work continues.
         try:
-            anim = asyncio.create_task(_animate_picker(picker, index))
-            delivered = await process(
-                update,
+            await callback.answer()
+        except Exception as exc:
+            log.debug("Не удалось подтвердить callback до обработки: %s", exc)
+
+        async def start_animation():
+            nonlocal anim
+            if anim is None:
+                anim = asyncio.create_task(_animate_picker(picker, index))
+
+        delivered = await process(
+            update,
+            ctx,
+            selected["url"],
+            notify_errors=False,
+            on_started=start_animation,
+        )
+        if not delivered:
+            await send_generic_error(
                 ctx,
-                selected["url"],
-                notify_errors=False,
+                picker.chat_id,
+                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
             )
-            if delivered:
-                await callback.answer()
-            else:
-                try:
-                    await callback.answer(
-                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-                        show_alert=True,
-                    )
-                except Exception:
-                    # Telegram callback alerts expire quickly. If the alert can no
-                    # longer be shown, fall back to a short-lived chat notification.
-                    await send_generic_error(
-                        ctx,
-                        picker.chat_id,
-                        "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-                    )
-        finally:
-            if anim:
-                anim.cancel()
-                try:
-                    await anim
-                except (asyncio.CancelledError, Exception):
-                    pass
-                try:  # вернуть окно выбора в исходный вид
-                    await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
-                except Exception as exc:
-                    log.debug("Не удалось восстановить окно выбора: %s", exc)
-            _release_processing(processing_tokens, token)
     except (ValueError, AttributeError, TypeError):
-        try:
-            await callback.answer(
-                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
-                show_alert=True,
+        if claimed and picker:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
             )
-        except Exception:
-            pass
+        elif callback:
+            try:
+                await callback.answer(
+                    "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+    except Exception:
+        log.exception("Ошибка обработки выбора трека")
+        if picker:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
+            )
+    finally:
+        if anim:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:  # вернуть окно выбора в исходный вид
+                await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
+            except Exception as exc:
+                log.debug("Не удалось восстановить окно выбора: %s", exc)
+        if claimed and processing_tokens is not None and token is not None:
+            _release_processing(processing_tokens, token)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1385,7 +1459,8 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
+        .update_queue(asyncio.Queue(maxsize=MAX_PENDING_UPDATES))
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
         .post_init(post_init)
         .build()
     )
@@ -1400,6 +1475,11 @@ def main():
         )
     log.info("yt-dlp %s, стратегий: %d, PO-provider: %s",
              yt_dlp.version.__version__, len(STRATEGIES), POT_PROVIDER_URL or "нет")
+    log.info(
+        "Лимиты: updates=%d pending_updates=%d search=%d downloads=%d sends=%d video=%d",
+        MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, MAX_PARALLEL_SEARCH,
+        MAX_PARALLEL_DL, MAX_PARALLEL_SEND, MAX_PARALLEL_VIDEO,
+    )
     log.info("Бот запущен, polling начат")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
