@@ -1056,7 +1056,7 @@ class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
             samples["telegram_send_api_seconds"][0],
         )
         self.assertGreaterEqual(samples["send_wait_seconds"][0], 0.0)
-        self.assertIn("kind=file_id", log_info.call_args.args[0])
+        self.assertEqual(log_info.call_args.args[1], "file_id")
 
     async def test_fresh_upload_send_records_upload_size_and_duration(self):
         class FakeAudio:
@@ -1079,8 +1079,8 @@ class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(result, "sent")
-        self.assertIn("kind=upload", log_info.call_args.args[0])
-        self.assertAlmostEqual(log_info.call_args.args[3], 2048 / (1024 * 1024), places=5)
+        self.assertEqual(log_info.call_args.args[1], "upload")
+        self.assertAlmostEqual(log_info.call_args.args[4], 2048 / (1024 * 1024), places=5)
         self.assertEqual(len(metrics["_runtime_metrics"]["telegram_send_total_seconds"]), 1)
 
     async def test_audio_sends_share_a_concurrency_limit(self):
