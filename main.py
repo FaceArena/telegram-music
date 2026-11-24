@@ -17,12 +17,10 @@ import threading
 import time
 import unicodedata
 import secrets
-import wave
 from pathlib import Path
 from functools import wraps
 from urllib.parse import urlsplit
 
-import numpy as np
 
 from dotenv import load_dotenv
 
@@ -227,7 +225,7 @@ MAX_PARALLEL_VIDEO = _env_int("MAX_PARALLEL_VIDEO", 2, minimum=1)
 VIDEO_LOCK = asyncio.Semaphore(MAX_PARALLEL_VIDEO)
 MAX_PARALLEL_BASS = _env_int("MAX_PARALLEL_BASS", 2, minimum=1)
 BASS_LOCK = asyncio.Semaphore(MAX_PARALLEL_BASS)
-BASS_PRESETS = {"original": None, "bass": 5.0, "boost": 9.0, "extreme": 12.0, "real_sub": None}
+BASS_PRESETS = {"original": None, "bass": 5.0, "boost": 9.0, "extreme": 12.0}
 MAX_CONCURRENT_UPDATES = _env_int("MAX_CONCURRENT_UPDATES", 32, minimum=1)
 MAX_PENDING_UPDATES = _env_int("MAX_PENDING_UPDATES", 128, minimum=1)
 _last_finish = 0.0
@@ -753,149 +751,6 @@ def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
         raise RuntimeError(details[-500:])
 
 
-def _build_sub_bass(samples: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Synthesize a mono sub layer by tracking stable low notes in the source."""
-    samples = np.asarray(samples, dtype=np.float32)
-    if samples.ndim != 1 or sample_rate < 8000 or samples.size < sample_rate:
-        raise ValueError("audio is too short for Sub Bass analysis")
-
-    frame_size = 4096
-    hop = 2048
-    window = np.hanning(frame_size).astype(np.float32)
-    frequencies = np.fft.rfftfreq(frame_size, 1.0 / sample_rate)
-    band = np.flatnonzero((frequencies >= 32.0) & (frequencies <= 190.0))
-    if band.size < 3:
-        raise ValueError("invalid analysis frequency range")
-
-    frame_notes = []
-    frame_levels = []
-    centers = []
-    for start in range(0, max(1, samples.size - frame_size + 1), hop):
-        frame = samples[start:start + frame_size]
-        if frame.size < frame_size:
-            frame = np.pad(frame, (0, frame_size - frame.size))
-        rms = float(np.sqrt(np.mean(frame * frame)))
-        frame_levels.append(rms)
-        centers.append(min(samples.size - 1, start + frame_size // 2))
-        if rms < 0.00035:
-            frame_notes.append(np.nan)
-            continue
-
-        spectrum = np.abs(np.fft.rfft(frame * window))
-        local = spectrum[band]
-        peak_index = int(np.argmax(local))
-        peak_bin = int(band[peak_index])
-        if peak_index == 0 or peak_index == band.size - 1:
-            frame_notes.append(np.nan)
-            continue
-
-        # Parabolic interpolation reduces FFT-bin quantization before note mapping.
-        left, middle, right = np.log(local[peak_index - 1:peak_index + 2] + 1e-12)
-        denominator = left - 2.0 * middle + right
-        offset = 0.5 * (left - right) / denominator if abs(denominator) > 1e-9 else 0.0
-        detected_hz = (peak_bin + float(np.clip(offset, -0.5, 0.5))) * sample_rate / frame_size
-        midi_note = int(round(69 + 12 * np.log2(detected_hz / 440.0)))
-        note_hz = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
-
-        # Keep the generated fundamental in a practical sub range (roughly 38–75 Hz).
-        while note_hz < 38.0:
-            note_hz *= 2.0
-        while note_hz > 75.0:
-            note_hz /= 2.0
-        frame_notes.append(note_hz)
-
-    notes = np.asarray(frame_notes, dtype=np.float32)
-    levels = np.asarray(frame_levels, dtype=np.float32)
-    valid = np.isfinite(notes)
-    if int(valid.sum()) < 3:
-        raise RuntimeError("Не удалось надёжно определить басовые ноты для Sub Bass.")
-
-    # Fill brief gaps and smooth note jumps; do not invent a bass line in long silent gaps.
-    positions = np.asarray(centers, dtype=np.float64)
-    valid_positions = positions[valid]
-    valid_notes = notes[valid]
-    smoothed = np.empty_like(valid_notes)
-    for i in range(valid_notes.size):
-        smoothed[i] = float(np.median(valid_notes[max(0, i - 1):min(valid_notes.size, i + 2)]))
-
-    sample_positions = np.arange(samples.size, dtype=np.float32)
-    note_curve = np.interp(sample_positions, valid_positions, smoothed).astype(np.float32)
-    level_curve = np.interp(sample_positions, positions, levels).astype(np.float32)
-    gate = np.clip((level_curve - 0.00025) / 0.012, 0.0, 1.0)
-    # A soft attack/release prevents clicks at phrase boundaries.
-    smoothing = max(1, int(sample_rate * 0.012))
-    kernel = np.ones(smoothing, dtype=np.float32) / smoothing
-    gate = np.convolve(gate, kernel, mode="same").astype(np.float32)
-    # Accumulate phase in short chunks to avoid a large float64 temporary on long tracks.
-    sub = np.empty(samples.size, dtype=np.float32)
-    phase = 0.0
-    chunk_size = sample_rate * 5
-    for start in range(0, samples.size, chunk_size):
-        end = min(samples.size, start + chunk_size)
-        phase_curve = phase + (2.0 * np.pi / sample_rate) * np.cumsum(
-            note_curve[start:end], dtype=np.float64
-        )
-        sub[start:end] = 0.30 * gate[start:end] * np.sin(phase_curve)
-        phase = float(np.remainder(phase_curve[-1], 2.0 * np.pi))
-    if not np.isfinite(sub).all() or float(np.max(np.abs(sub))) < 0.005:
-        raise RuntimeError("Не удалось сформировать басовую дорожку.")
-    return sub
-
-
-def _apply_real_sub_bass(input_path: Path, output_path: Path) -> None:
-    """Add a synthesized, pitch-tracked sub-bass layer without EQ-boosting the vocal."""
-    # 8 kHz is sufficient for a sub-bass layer and keeps Railway memory use bounded.
-    sample_rate = 8000
-    decoded = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-i", str(input_path), "-map", "0:a:0", "-vn", "-ac", "1",
-            "-ar", str(sample_rate), "-f", "f32le", "pipe:1",
-        ],
-        capture_output=True, timeout=240, check=False,
-    )
-    if decoded.returncode != 0 or not decoded.stdout:
-        details = decoded.stderr.decode("utf-8", "replace") if decoded.stderr else "audio decode failed"
-        raise RuntimeError(details[-500:])
-    source_samples = np.frombuffer(decoded.stdout, dtype="<f4")
-    sub_samples = _build_sub_bass(source_samples, sample_rate)
-
-    with tempfile.TemporaryDirectory(prefix="real_sub_") as directory:
-        sub_path = Path(directory) / "sub-bass.wav"
-        pcm = np.clip(sub_samples, -0.95, 0.95)
-        pcm16 = (pcm * 32767.0).astype("<i2")
-        with wave.open(str(sub_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(pcm16.tobytes())
-
-        if AUDIO_FORMAT == "m4a":
-            codec_args = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
-        else:
-            codec_args = ["-c:a", "libmp3lame", "-q:a", "2"]
-        command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-i", str(input_path), "-i", str(sub_path),
-            "-filter_complex",
-            "[0:a]aformat=sample_fmts=fltp[original];"
-            "[1:a]aformat=sample_fmts=fltp,lowpass=f=95[sub];"
-            "[original][sub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-            "alimiter=limit=0.95:attack=5:release=50:level=disabled[out]",
-            "-map", "[out]", "-map_metadata", "0", *codec_args, str(output_path),
-        ]
-        completed = subprocess.run(
-            command, capture_output=True, text=True, timeout=240, check=False
-        )
-    if (
-        completed.returncode != 0
-        or not output_path.is_file()
-        or output_path.stat().st_size <= 0
-    ):
-        details = (completed.stderr or "FFmpeg Sub Bass mix failed").strip()
-        raise RuntimeError(details[-500:])
-
-
 def _extract_only(url: str):
     """Получить данные о видео без скачивания (ссылки на форматы остаются в info)."""
     workdir = Path(tempfile.mkdtemp(prefix="pre_"))
@@ -1247,6 +1102,7 @@ async def process(
     notify_errors: bool = True,
     on_started=None,
     bass_preset: str = "original",
+    reply_markup=None,
 ):
     global _last_finish
     if bass_preset not in BASS_PRESETS:
@@ -1275,6 +1131,7 @@ async def process(
                     title=clean_metadata(row[1], 128),
                     performer=clean_metadata(row[2], 128),
                     duration=row[3], read_timeout=60, write_timeout=60,
+                    reply_markup=reply_markup,
                 )
             except Exception as exc:
                 if _is_invalid_file_id_error(exc):
@@ -1353,14 +1210,9 @@ async def process(
                 processed_path = workdir / f"processed.{AUDIO_FORMAT}"
                 try:
                     async with BASS_LOCK:
-                        if bass_preset == "real_sub":
-                            await loop.run_in_executor(
-                                None, _apply_real_sub_bass, path, processed_path
-                            )
-                        else:
-                            await loop.run_in_executor(
-                                None, _apply_bass_boost, path, processed_path, bass_preset
-                            )
+                        await loop.run_in_executor(
+                            None, _apply_bass_boost, path, processed_path, bass_preset
+                        )
                 except Exception:
                     _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
                     raise
@@ -1381,6 +1233,7 @@ async def process(
                     performer=clean_metadata(info.get("artist") or info.get("uploader"), 128),
                     duration=int(info.get("duration") or 0) or None,
                     filename=f"{clean_metadata(info.get('title'), 60) or 'track'}.{AUDIO_FORMAT}",
+                    reply_markup=reply_markup,
                     read_timeout=180,
                     write_timeout=180,
                     connect_timeout=30,
@@ -1607,23 +1460,24 @@ async def _animate_picker(message, index: int):
         await asyncio.sleep(ANIM_INTERVAL)
 
 
+def build_audio_keyboard(token: str, label: str = "🔊 Добавить басс") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"bassmenu:{token}")
+    ]])
+
+
 def build_bass_keyboard(token: str, index: int) -> InlineKeyboardMarkup:
     options = [
         ("🎵 Оригинал", "original"),
         ("🔊 Bass", "bass"),
         ("🔥 Bass Boost", "boost"),
         ("💥 Extreme Bass", "extreme"),
-        ("🎸 Real Bass · Sub", "real_sub"),
     ]
     buttons = [
-        InlineKeyboardButton(label, callback_data=f"bass:{token}:{index}:{preset}")
+        InlineKeyboardButton(label, callback_data=f"bassapply:{token}:{index}:{preset}")
         for label, preset in options
     ]
-    return InlineKeyboardMarkup([
-        buttons[:2],
-        buttons[2:],
-        [InlineKeyboardButton("↩️ Другая версия", callback_data=f"back:{token}")],
-    ])
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
 def build_download_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -1661,7 +1515,7 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
 
 @_track_runtime_metric("picker")
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Select a search result without replacing the original 10-track picker."""
+    """Send the selected track immediately with an inline bass action."""
     callback = update.callback_query
     token = None
     picker = callback.message if callback else None
@@ -1686,108 +1540,141 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
         if not _claim_processing(processing_tokens, token):
-            await callback.answer("⏳ Подожди, текущий трек ещё обрабатывается.")
+            await callback.answer("⏳ Подожди, текущий трек ещё отправляется.")
             return
         claimed = True
-        await callback.answer()
+        await callback.answer("Готовлю музыку…")
 
         selected = results[index]
-        title = clean_metadata(selected.get("title"), 120) or "Без названия"
-        data["stage"] = "bass"
+        data["stage"] = "sent"
         data["selected_index"] = index
-        data["selected_preset"] = None
-        prompt = (
-            f"🎵 Выбрана версия {index + 1} из {len(results)}:\n"
-            f"{title}\n\n"
-            "Теперь выбери обработку баса. Список из 10 версий останется выше — "
-            "можно вернуться и выбрать другую."
+        data["selected_preset"] = "original"
+        delivered = await process(
+            update,
+            ctx,
+            selected["url"],
+            notify_errors=False,
+            bass_preset="original",
+            reply_markup=build_audio_keyboard(token),
         )
-        bass_message_id = data.get("bass_message_id")
-        if bass_message_id:
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=picker.chat_id,
-                    message_id=bass_message_id,
-                    text=prompt,
-                    reply_markup=build_bass_keyboard(token, index),
-                )
-            except BadRequest as exc:
-                if "message is not modified" not in str(exc).lower():
-                    raise
-        else:
-            bass_message = await picker.reply_text(
-                prompt,
-                reply_markup=build_bass_keyboard(token, index),
+        if not delivered:
+            data["stage"] = "select"
+            data["selected_index"] = None
+            data["selected_preset"] = None
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось отправить музыку. Выбери эту или другую версию ещё раз.",
             )
-            data["bass_message_id"] = bass_message.message_id
     except (ValueError, AttributeError, TypeError):
         if callback:
-            try:
-                await callback.answer("⚠️ Не удалось обработать выбор. Выполните поиск ещё раз.", show_alert=True)
-            except Exception:
-                pass
+            await callback.answer("⚠️ Не удалось отправить выбранную версию.", show_alert=True)
     except Exception:
-        log.exception("Ошибка выбора версии трека")
+        log.exception("Ошибка отправки выбранной версии")
         if picker:
-            await send_generic_error(ctx, picker.chat_id, "⚠️ Не удалось открыть настройки трека. Попробуйте ещё раз.")
+            await send_generic_error(ctx, picker.chat_id, "⚠️ Не удалось отправить музыку.")
     finally:
         if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
 
 
+async def on_bass_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Open the bass presets directly under the delivered audio message."""
+    callback = update.callback_query
+    audio_message = callback.message if callback else None
+    try:
+        _, token = callback.data.split(":")
+        if not audio_message:
+            await callback.answer()
+            return
+        data = _get_search_state(
+            ctx.application.bot_data.setdefault("music_searches", {}),
+            token,
+            audio_message.chat_id,
+        )
+        if (
+            not data
+            or data.get("stage") != "sent"
+            or not audio_message.audio
+            or data.get("selected_index") is None
+        ):
+            await callback.answer("❗ Время выбора истекло. Выбери песню заново.", show_alert=True)
+            return
+        await callback.answer()
+        await audio_message.edit_reply_markup(
+            reply_markup=build_bass_keyboard(token, data["selected_index"])
+        )
+    except Exception:
+        log.exception("Ошибка открытия меню баса")
+        if callback:
+            await callback.answer("⚠️ Не удалось открыть настройки баса.", show_alert=True)
+
+
 @_track_runtime_metric("picker")
 async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Choose a bass preset; downloading is a separate explicit action."""
+    """Apply a chosen bass preset and send the processed copy immediately."""
     callback = update.callback_query
     token = None
-    prompt = callback.message if callback else None
+    audio_message = callback.message if callback else None
+    claimed = False
+    processing_tokens = None
     try:
         _, token, raw_index, preset = callback.data.split(":")
         index = int(raw_index)
-        if not prompt:
+        if not audio_message:
             await callback.answer()
             return
-        searches = ctx.application.bot_data.setdefault("music_searches", {})
-        data = _get_search_state(searches, token, prompt.chat_id)
+        data = _get_search_state(
+            ctx.application.bot_data.setdefault("music_searches", {}),
+            token,
+            audio_message.chat_id,
+        )
         if (
             not data
-            or data.get("stage") != "bass"
-            or data.get("bass_message_id") != prompt.message_id
+            or data.get("stage") != "sent"
             or data.get("selected_index") != index
+            or not audio_message.audio
         ):
-            await callback.answer("❗ Выбор устарел. Нажми на нужную версию ещё раз.", show_alert=True)
+            await callback.answer("❗ Эта настройка устарела. Выбери песню заново.", show_alert=True)
             return
         if preset not in BASS_PRESETS:
             await callback.answer("⚠️ Неизвестный режим обработки.", show_alert=True)
             return
 
-        results = data.get("results") or []
-        if index < 0 or index >= len(results):
-            await callback.answer("⚠️ Выбранная версия больше недоступна.", show_alert=True)
+        processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
+        if not _claim_processing(processing_tokens, token):
+            await callback.answer("⏳ Трек уже обрабатывается.")
             return
+        claimed = True
+        await callback.answer("Применяю обработку…")
+        selected = (data.get("results") or [])[index]
+        await audio_message.edit_reply_markup(reply_markup=None)
         data["selected_preset"] = preset
-        await callback.answer("Режим выбран")
-        selected = results[index]
-        title = clean_metadata(selected.get("title"), 120) or "Без названия"
-        preset_labels = {
-            "original": "🎵 Оригинал",
-            "bass": "🔊 Bass",
-            "boost": "🔥 Bass Boost",
-            "extreme": "💥 Extreme Bass",
-            "real_sub": "🎸 Real Bass · Powerful Sub",
-        }
-        await prompt.edit_text(
-            f"✅ Всё готово к скачиванию\n\n{title}\nОбработка: {preset_labels[preset]}\n\n"
-            "Проверь версию. Если всё верно — скачивай. Если нет, вернись к 10 вариантам.",
-            reply_markup=build_download_keyboard(token),
+        delivered = await process(
+            update,
+            ctx,
+            selected["url"],
+            notify_errors=False,
+            bass_preset=preset,
+            reply_markup=build_audio_keyboard(token, "🎚 Изменить басс"),
         )
+        if not delivered:
+            await audio_message.edit_reply_markup(
+                reply_markup=build_bass_keyboard(token, index)
+            )
+            await send_generic_error(
+                ctx, audio_message.chat_id,
+                "⚠️ Не удалось обработать музыку. Попробуй другой режим.",
+            )
     except (ValueError, AttributeError, TypeError, IndexError):
         if callback:
-            await callback.answer("⚠️ Не удалось выбрать обработку. Попробуй ещё раз.", show_alert=True)
+            await callback.answer("⚠️ Не удалось применить обработку. Попробуй ещё раз.", show_alert=True)
     except Exception:
-        log.exception("Ошибка выбора обработки баса")
-        if prompt:
-            await send_generic_error(ctx, prompt.chat_id, "⚠️ Не удалось сохранить настройки трека.")
+        log.exception("Ошибка обработки баса")
+        if audio_message:
+            await send_generic_error(ctx, audio_message.chat_id, "⚠️ Не удалось обработать музыку.")
+    finally:
+        if claimed and processing_tokens is not None and token is not None:
+            _release_processing(processing_tokens, token)
 
 
 async def on_bass_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2123,10 +2010,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
-    app.add_handler(CallbackQueryHandler(on_bass_pick, pattern=r"^bass:"))
-    app.add_handler(CallbackQueryHandler(on_bass_change, pattern=r"^basschange:"))
-    app.add_handler(CallbackQueryHandler(on_picker_back, pattern=r"^back:"))
-    app.add_handler(CallbackQueryHandler(on_download_pick, pattern=r"^download:"))
+    app.add_handler(CallbackQueryHandler(on_bass_menu, pattern=r"^bassmenu:"))
+    app.add_handler(CallbackQueryHandler(on_bass_pick, pattern=r"^bassapply:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
