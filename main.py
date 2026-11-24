@@ -1854,7 +1854,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # JobQueue может отсутствовать в минимальной установке PTB.
         ctx.application.create_task(
             _delete_start_messages_after_delay(
-                ctx.bot, message.chat_id, sent_messages
+                ctx.bot, update.effective_chat.id, sent_messages
             )
         )
 
