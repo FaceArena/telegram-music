@@ -221,6 +221,9 @@ MAX_PARALLEL_SEND = _env_int("MAX_PARALLEL_SEND", 5, minimum=1)
 SEND_LOCK = asyncio.Semaphore(MAX_PARALLEL_SEND)
 MAX_PARALLEL_VIDEO = _env_int("MAX_PARALLEL_VIDEO", 2, minimum=1)
 VIDEO_LOCK = asyncio.Semaphore(MAX_PARALLEL_VIDEO)
+MAX_PARALLEL_BASS = _env_int("MAX_PARALLEL_BASS", 2, minimum=1)
+BASS_LOCK = asyncio.Semaphore(MAX_PARALLEL_BASS)
+BASS_PRESETS = {"original": None, "bass": 5.0, "boost": 9.0, "extreme": 12.0}
 MAX_CONCURRENT_UPDATES = _env_int("MAX_CONCURRENT_UPDATES", 32, minimum=1)
 MAX_PENDING_UPDATES = _env_int("MAX_PENDING_UPDATES", 128, minimum=1)
 _last_finish = 0.0
@@ -706,6 +709,46 @@ def _download(query: str, is_url: bool, workdir: Path, use_cookies: bool, client
     return info, (files[0] if files else None)
 
 
+def bass_filter_for_preset(preset: str) -> str | None:
+    """Return a conservative low-shelf boost plus a peak limiter."""
+    if preset not in BASS_PRESETS:
+        raise ValueError("unknown bass preset")
+    gain = BASS_PRESETS[preset]
+    if gain is None:
+        return None
+    return (
+        f"bass=g={gain:.1f}:f=90:width_type=q:width=0.7,"
+        "alimiter=limit=0.95:attack=5:release=50:level=disabled"
+    )
+
+
+def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
+    """Apply bass processing without blocking the asyncio event loop."""
+    audio_filter = bass_filter_for_preset(preset)
+    if audio_filter is None:
+        raise ValueError("original preset does not require FFmpeg processing")
+    if AUDIO_FORMAT == "m4a":
+        codec_args = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    else:
+        codec_args = ["-c:a", "libmp3lame", "-q:a", "2"]
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-i", str(input_path), "-map", "0:a:0", "-vn",
+        "-af", audio_filter, "-map_metadata", "0",
+        *codec_args, str(output_path),
+    ]
+    completed = subprocess.run(
+        command, capture_output=True, text=True, timeout=180, check=False
+    )
+    if (
+        completed.returncode != 0
+        or not output_path.is_file()
+        or output_path.stat().st_size <= 0
+    ):
+        details = (completed.stderr or "FFmpeg bass processing failed").strip()
+        raise RuntimeError(details[-500:])
+
+
 def _extract_only(url: str):
     """Получить данные о видео без скачивания (ссылки на форматы остаются в info)."""
     workdir = Path(tempfile.mkdtemp(prefix="pre_"))
@@ -1051,8 +1094,11 @@ async def process(
     error_text: str = "⚠️ Произошла ошибка.",
     notify_errors: bool = True,
     on_started=None,
+    bass_preset: str = "original",
 ):
     global _last_finish
+    if bass_preset not in BASS_PRESETS:
+        raise ValueError("unknown bass preset")
     chat_id = update.effective_chat.id
     is_url = bool(URL_RE.fullmatch(query))
     if is_url and not is_youtube_url(query):
@@ -1061,7 +1107,7 @@ async def process(
         return False
 
     vid = video_id_of(query) if is_url else None
-    if vid and CACHE:
+    if vid and CACHE and bass_preset == "original":
         row = _safe_cache_call(CACHE, "get_track", vid)
         _metric_increment(
             ctx.application.bot_data,
@@ -1151,6 +1197,18 @@ async def process(
             if not path:
                 raise RuntimeError(last_err or "download failed")
 
+            if bass_preset != "original":
+                processed_path = workdir / f"processed.{AUDIO_FORMAT}"
+                try:
+                    async with BASS_LOCK:
+                        await loop.run_in_executor(
+                            None, _apply_bass_boost, path, processed_path, bass_preset
+                        )
+                except Exception:
+                    _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
+                    raise
+                path = processed_path
+
             if path.stat().st_size > TG_LIMIT:
                 raise RuntimeError("file exceeds Telegram upload limit")
 
@@ -1176,10 +1234,18 @@ async def process(
             performer = info.get("artist") or info.get("uploader")
             duration = int(info.get("duration") or 0) or None
             if CACHE and sent and sent.audio and successful_video_id:
-                _record_successful_delivery(
-                    CACHE, successful_video_id, sent.audio.file_id, title, performer,
-                    duration, update.effective_user.id if update.effective_user else None,
-                )
+                user_id = update.effective_user.id if update.effective_user else None
+                if bass_preset == "original":
+                    _record_successful_delivery(
+                        CACHE, successful_video_id, sent.audio.file_id, title, performer,
+                        duration, user_id,
+                    )
+                else:
+                    # Never cache a processed Telegram file_id as the original track.
+                    _safe_cache_call(
+                        CACHE, "record_download", successful_video_id, title, performer,
+                        duration, user_id=user_id,
+                    )
             log.info("Отправка аудио в Telegram завершена за %.1f с (%.1f МБ)",
                      time.monotonic() - upload_started, path.stat().st_size / (1024 * 1024))
             delivered = True
@@ -1367,7 +1433,7 @@ async def _animate_picker(message, index: int):
         keyboard = [
             [
                 InlineKeyboardButton(
-                    frame if r * 5 + c == index else b.text,
+                    frame if sum(len(previous) for previous in markup.inline_keyboard[:r]) + c == index else b.text,
                     callback_data=b.callback_data,
                 )
                 for c, b in enumerate(row)
@@ -1382,6 +1448,22 @@ async def _animate_picker(message, index: int):
         except Exception as exc:
             log.debug("Анимация: %s", exc)
         await asyncio.sleep(ANIM_INTERVAL)
+
+
+def build_bass_keyboard(token: str, index: int) -> InlineKeyboardMarkup:
+    options = [
+        ("🎵 Оригинал", "original"),
+        ("🔊 Bass", "bass"),
+        ("🔥 Bass Boost", "boost"),
+        ("💥 Extreme Bass", "extreme"),
+    ]
+    buttons = [
+        InlineKeyboardButton(
+            label, callback_data=f"bass:{token}:{index}:{preset}"
+        )
+        for label, preset in options
+    ]
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
 def _claim_processing(processing_tokens: set, token: str) -> bool:
@@ -1440,6 +1522,10 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data.get("stage") == "bass":
+            await callback.answer("Сначала выбери обработку баса.", show_alert=True)
+            return
+
         selected = results[index]
         processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
         # The set is application-wide, so two group members cannot race the same picker.
@@ -1455,24 +1541,15 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             log.debug("Не удалось подтвердить callback до обработки: %s", exc)
 
-        async def start_animation():
-            nonlocal anim
-            if anim is None:
-                anim = asyncio.create_task(_animate_picker(picker, index))
-
-        delivered = await process(
-            update,
-            ctx,
-            selected["url"],
-            notify_errors=False,
-            on_started=start_animation,
+        title = clean_metadata(selected.get("title"), 120) or "Без названия"
+        edited_picker = await picker.edit_text(
+            f"🔊 Выбери обработку баса для трека:\n\n{title}",
+            reply_markup=build_bass_keyboard(token, index),
         )
-        if not delivered:
-            await send_generic_error(
-                ctx,
-                picker.chat_id,
-                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-            )
+        if edited_picker:
+            picker = edited_picker
+        data["stage"] = "bass"
+        data["selected_index"] = index
     except (ValueError, AttributeError, TypeError):
         if claimed and picker:
             await send_generic_error(
@@ -1505,6 +1582,112 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
             except Exception as exc:
                 log.debug("Не удалось восстановить окно выбора: %s", exc)
+        if claimed and processing_tokens is not None and token is not None:
+            _release_processing(processing_tokens, token)
+
+
+
+@_track_runtime_metric("picker")
+async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    callback = update.callback_query
+    processing_tokens = None
+    token = None
+    picker = None
+    anim = None
+    claimed = False
+    try:
+        _, token, raw_index, preset = callback.data.split(":")
+        index = int(raw_index)
+        picker = callback.message
+        if not picker:
+            await callback.answer()
+            return
+
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        data = _get_search_state(searches, token, picker.chat_id)
+        if (
+            not data
+            or data.get("message_id") != picker.message_id
+            or data.get("stage") != "bass"
+            or data.get("selected_index") != index
+        ):
+            await callback.answer(
+                "❗ Время истекло. Выполните новый поиск.",
+                show_alert=True,
+            )
+            return
+        if preset not in BASS_PRESETS:
+            await callback.answer("⚠️ Неизвестный режим обработки.", show_alert=True)
+            return
+
+        results = data.get("results") or []
+        if index < 0 or index >= len(results):
+            await callback.answer("⚠️ Выполните поиск ещё раз.", show_alert=True)
+            return
+
+        processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
+        if not _claim_processing(processing_tokens, token):
+            await callback.answer()
+            return
+        claimed = True
+
+        try:
+            await callback.answer()
+        except Exception as exc:
+            log.debug("Не удалось подтвердить callback перед обработкой баса: %s", exc)
+
+        async def start_animation():
+            nonlocal anim
+            if anim is None:
+                option_index = ["original", "bass", "boost", "extreme"].index(preset)
+                anim = asyncio.create_task(_animate_picker(picker, option_index))
+
+        selected = results[index]
+        delivered = await process(
+            update,
+            ctx,
+            selected["url"],
+            notify_errors=False,
+            on_started=start_animation,
+            bass_preset=preset,
+        )
+        if not delivered:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
+            )
+    except (ValueError, AttributeError, TypeError):
+        if claimed and picker:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
+            )
+        elif callback:
+            try:
+                await callback.answer(
+                    "⚠️ Не удалось обработать выбор. Выполните поиск ещё раз.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+    except Exception:
+        log.exception("Ошибка обработки выбора баса")
+        if picker:
+            await send_generic_error(
+                ctx, picker.chat_id,
+                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
+            )
+    finally:
+        if anim:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
+            except Exception as exc:
+                log.debug("Не удалось восстановить меню баса: %s", exc)
         if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
 
@@ -1642,6 +1825,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(on_bass_pick, pattern=r"^bass:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
