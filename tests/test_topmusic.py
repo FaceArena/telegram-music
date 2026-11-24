@@ -775,7 +775,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         markup = process_mock.await_args.kwargs["reply_markup"]
         button = markup.inline_keyboard[0][0]
         self.assertEqual(button.text, "🔊 Добавить басс")
-        self.assertEqual(button.callback_data, "bassmenu:live-token")
+        self.assertEqual(button.callback_data, "bassmenu:live-token:0")
         self.assertNotIn("live-token", bot_data["music_processing_tokens"])
 
     async def test_duplicate_picker_click_does_not_release_existing_claim(self):
@@ -1118,10 +1118,10 @@ class BassProcessingTests(unittest.TestCase):
 
     def test_audio_keyboard_has_inline_add_bass_button(self):
         from main import build_audio_keyboard
-        buttons = [button for row in build_audio_keyboard("0123456789abcdef").inline_keyboard for button in row]
+        buttons = [button for row in build_audio_keyboard("0123456789abcdef", 9).inline_keyboard for button in row]
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].text, "🔊 Добавить басс")
-        self.assertEqual(buttons[0].callback_data, "bassmenu:0123456789abcdef")
+        self.assertEqual(buttons[0].callback_data, "bassmenu:0123456789abcdef:9")
 
     def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
         with tempfile.TemporaryDirectory() as directory:
