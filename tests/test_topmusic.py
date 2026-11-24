@@ -171,6 +171,22 @@ class TopMusicRankingTests(unittest.TestCase):
         self.cache.drop_track("video_A123")
         self.assertIsNone(self.cache.get_track("video_A123"))
 
+    def test_old_audio_cache_entries_are_invalidated(self):
+        legacy_key = f"video_A123:{__import__('main').AUDIO_FORMAT}"
+        with self.cache.lock:
+            self.cache.db.execute(
+                "INSERT INTO tracks VALUES (?, ?, ?, ?, ?, ?)",
+                (legacy_key, "old-telegram-file-id", "Song A", "Artist A", 180, time.time()),
+            )
+            self.cache.db.commit()
+
+        self.assertIsNone(self.cache.get_track("video_A123"))
+        self.cache.put_track("video_A123", "new-telegram-file-id", "Song A", "Artist A", 180)
+        self.assertEqual(
+            self.cache.get_track("video_A123"),
+            ("new-telegram-file-id", "Song A", "Artist A", 180),
+        )
+
 
 class PickerProcessingLockTests(unittest.TestCase):
     def test_shared_picker_token_can_only_be_claimed_once(self):
