@@ -1497,12 +1497,15 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
 
 @_track_runtime_metric("picker")
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Send the selected track immediately with an inline bass action."""
+    """Send the selected track immediately with an animated clock while it loads."""
     callback = update.callback_query
     token = None
     picker = callback.message if callback else None
+    anim = None
     claimed = False
     processing_tokens = None
+    original_text = picker.text if picker else None
+    original_markup = picker.reply_markup if picker else None
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
@@ -1525,7 +1528,11 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await callback.answer("⏳ Подожди, текущий трек ещё отправляется.")
             return
         claimed = True
-        await callback.answer("Готовлю музыку…")
+        await callback.answer("Загружаю…")
+
+        # Start immediately on button press so the user sees the clock even
+        # while this request is waiting for the download semaphore.
+        anim = asyncio.create_task(_animate_picker(picker, index))
 
         selected = results[index]
         data["stage"] = "sent"
@@ -1555,9 +1562,20 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if picker:
             await send_generic_error(ctx, picker.chat_id, "⚠️ Не удалось отправить музыку.")
     finally:
+        if anim:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+            # Restore the original 10-choice picker after the clock animation.
+            if picker and original_text is not None:
+                try:
+                    await picker.edit_text(original_text, reply_markup=original_markup)
+                except Exception as exc:
+                    log.debug("Не удалось восстановить список версий после загрузки: %s", exc)
         if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
-
 
 async def on_bass_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Open the bass presets directly under the delivered audio message."""
