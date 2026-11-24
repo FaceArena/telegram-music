@@ -1725,6 +1725,8 @@ async def on_download_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         index = data["selected_index"]
         preset = data["selected_preset"]
         selected = data["results"][index]
+        confirmation_text = prompt.text
+        confirmation_markup = prompt.reply_markup
 
         async def start_animation():
             nonlocal anim
@@ -1739,6 +1741,13 @@ async def on_download_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             on_started=start_animation,
             bass_preset=preset,
         )
+        if anim:
+            anim.cancel()
+            try:
+                await anim
+            except (asyncio.CancelledError, Exception):
+                pass
+            anim = None
         if delivered:
             await prompt.edit_text(
                 "✅ Трек отправлен!\n\nМожешь выбрать другую версию в списке из 10 вариантов выше.",
@@ -1747,6 +1756,7 @@ async def on_download_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]]),
             )
         else:
+            await prompt.edit_text(confirmation_text, reply_markup=confirmation_markup)
             await send_generic_error(
                 ctx, prompt.chat_id,
                 "⚠️ Не удалось обработать или отправить музыку. Попробуй скачать ещё раз.",
