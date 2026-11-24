@@ -1035,6 +1035,54 @@ class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_file_id_send_records_api_and_total_duration(self):
+        class FakeBot:
+            async def send_audio(self, **kwargs):
+                await asyncio.sleep(0.001)
+                return "sent"
+
+        metrics = {}
+        with patch("main.log.info") as log_info:
+            result = await _send_audio_limited(
+                FakeBot(), metrics=metrics, chat_id=123, audio="cached-file-id"
+            )
+
+        self.assertEqual(result, "sent")
+        samples = metrics["_runtime_metrics"]
+        self.assertEqual(len(samples["telegram_send_api_seconds"]), 1)
+        self.assertEqual(len(samples["telegram_send_total_seconds"]), 1)
+        self.assertGreaterEqual(
+            samples["telegram_send_total_seconds"][0],
+            samples["telegram_send_api_seconds"][0],
+        )
+        self.assertGreaterEqual(samples["send_wait_seconds"][0], 0.0)
+        self.assertIn("kind=file_id", log_info.call_args.args[0])
+
+    async def test_fresh_upload_send_records_upload_size_and_duration(self):
+        class FakeAudio:
+            def __init__(self, name):
+                self.name = name
+
+        class FakeBot:
+            async def send_audio(self, **kwargs):
+                await asyncio.sleep(0.001)
+                return "sent"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "song.mp3"
+            file_path.write_bytes(b"x" * 2048)
+            metrics = {}
+            with patch("main.log.info") as log_info:
+                result = await _send_audio_limited(
+                    FakeBot(), metrics=metrics, chat_id=123,
+                    audio=FakeAudio(str(file_path)),
+                )
+
+        self.assertEqual(result, "sent")
+        self.assertIn("kind=upload", log_info.call_args.args[0])
+        self.assertAlmostEqual(log_info.call_args.args[3], 2048 / (1024 * 1024), places=5)
+        self.assertEqual(len(metrics["_runtime_metrics"]["telegram_send_total_seconds"]), 1)
+
     async def test_audio_sends_share_a_concurrency_limit(self):
         active = 0
         peak = 0
@@ -1167,6 +1215,9 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
             "search_cache_hits": 3,
             "search_cache_misses": 1,
             "search_wait_seconds": [0.01, 0.02, 0.03],
+            "send_wait_seconds": [0.01, 0.02, 0.03],
+            "telegram_send_total_seconds": [0.2, 0.3, 0.4],
+            "telegram_send_api_seconds": [0.1, 0.2, 0.3],
             "search_latency_seconds": [0.1, 0.2, 0.3],
             "process_latency_seconds": [0.4, 0.5],
             "video_latency_seconds": [],
@@ -1193,6 +1244,7 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("RUNTIME_METRICS queue=%d/%d", message)
         self.assertEqual(args[1:3], (7, 128))
         self.assertIn("cache_hit(search=%.1f%%", message)
+        self.assertIn("send_p95_p99_ms(total=%.1f/%.1f api=%.1f/%.1f)", message)
         self.assertEqual(args[7], 75.0)
         self.assertIn("rss_peak_mb=%.1f", message)
 
