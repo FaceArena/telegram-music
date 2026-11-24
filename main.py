@@ -307,9 +307,9 @@ class Cache:
 
     @staticmethod
     def track_key(video_id: str) -> str:
-        # Versioned key invalidates Telegram file_ids created before the 320 kbps
-        # quality upgrade. Old rows remain unused; new requests re-download.
-        return f"{video_id}:{AUDIO_FORMAT}:q320-v2"
+        # Versioned key invalidates Telegram file_ids created before the unified
+        # final audio encoding pipeline. Old rows remain unused; new requests re-download.
+        return f"{video_id}:{AUDIO_FORMAT}:q320-v3"
 
     def get_track(self, video_id: str):
         with self.lock:
@@ -726,11 +726,9 @@ def bass_filter_for_preset(preset: str) -> str | None:
     )
 
 
-def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
-    """Apply bass processing without blocking the asyncio event loop."""
+def _encode_audio(input_path: Path, output_path: Path, preset: str = "original") -> None:
+    """Encode every delivered track with the same codec/bitrate; bass is optional."""
     audio_filter = bass_filter_for_preset(preset)
-    if audio_filter is None:
-        raise ValueError("original preset does not require FFmpeg processing")
     if AUDIO_FORMAT == "m4a":
         codec_args = ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"]
     else:
@@ -738,9 +736,12 @@ def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", str(input_path), "-map", "0:a:0", "-vn",
-        "-af", audio_filter, "-map_metadata", "0",
-        *codec_args, str(output_path),
     ]
+    # The standard mode deliberately has no audio filter: it gets the same final
+    # codec/bitrate as Bass, without changing its frequency balance.
+    if audio_filter is not None:
+        command.extend(["-af", audio_filter])
+    command.extend(["-map_metadata", "0", *codec_args, str(output_path)])
     completed = subprocess.run(
         command, capture_output=True, text=True, timeout=180, check=False
     )
@@ -749,8 +750,15 @@ def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
         or not output_path.is_file()
         or output_path.stat().st_size <= 0
     ):
-        details = (completed.stderr or "FFmpeg bass processing failed").strip()
+        details = (completed.stderr or "FFmpeg audio encoding failed").strip()
         raise RuntimeError(details[-500:])
+
+
+def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
+    """Backward-compatible wrapper for callers that explicitly apply bass."""
+    if preset == "original":
+        raise ValueError("original preset does not apply bass")
+    _encode_audio(input_path, output_path, preset)
 
 
 def _extract_only(url: str):
@@ -1192,17 +1200,23 @@ async def process(
             if not path:
                 raise RuntimeError(last_err or "download failed")
 
-            if bass_preset != "original":
-                processed_path = workdir / f"processed.{AUDIO_FORMAT}"
-                try:
+            # Finalize standard and bass variants through exactly the same encoder.
+            # "original" skips the EQ filter but still gets the same 320 kbps output.
+            processed_path = workdir / f"processed.{AUDIO_FORMAT}"
+            try:
+                if bass_preset == "original":
+                    await loop.run_in_executor(
+                        None, _encode_audio, path, processed_path, bass_preset
+                    )
+                else:
                     async with BASS_LOCK:
                         await loop.run_in_executor(
-                            None, _apply_bass_boost, path, processed_path, bass_preset
+                            None, _encode_audio, path, processed_path, bass_preset
                         )
-                except Exception:
-                    _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
-                    raise
-                path = processed_path
+            except Exception:
+                _metric_increment(ctx.application.bot_data, "ffmpeg_errors")
+                raise
+            path = processed_path
 
             if path.stat().st_size > TG_LIMIT:
                 raise RuntimeError("file exceeds Telegram upload limit")

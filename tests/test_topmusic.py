@@ -19,7 +19,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import AUDIO_FORMAT, _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import AUDIO_FORMAT, _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, _encode_audio, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -172,11 +172,17 @@ class TopMusicRankingTests(unittest.TestCase):
         self.assertIsNone(self.cache.get_track("video_A123"))
 
     def test_old_audio_cache_entries_are_invalidated(self):
-        legacy_key = f"video_A123:{AUDIO_FORMAT}"
+        legacy_keys = [
+            f"video_A123:{AUDIO_FORMAT}",
+            f"video_A123:{AUDIO_FORMAT}:q320-v2",
+        ]
         with self.cache.lock:
-            self.cache.db.execute(
+            self.cache.db.executemany(
                 "INSERT INTO tracks VALUES (?, ?, ?, ?, ?, ?)",
-                (legacy_key, "old-telegram-file-id", "Song A", "Artist A", 180, time.time()),
+                [
+                    (key, f"old-telegram-file-id-{index}", "Song A", "Artist A", 180, time.time())
+                    for index, key in enumerate(legacy_keys)
+                ],
             )
             self.cache.db.commit()
 
@@ -1222,6 +1228,27 @@ class BassProcessingTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].text, "🔊 Добавить басс")
         self.assertEqual(buttons[0].callback_data, "bassmenu:0123456789abcdef:9")
+
+    def test_standard_audio_uses_same_320k_encoder_without_bass_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp3"
+            target = Path(directory) / "processed.mp3"
+            source.write_bytes(b"source-audio")
+
+            def fake_ffmpeg(command, **kwargs):
+                Path(command[-1]).write_bytes(b"encoded-audio")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch("main.subprocess.run", side_effect=fake_ffmpeg) as run:
+                _encode_audio(source, target, "original")
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], "ffmpeg")
+            self.assertNotIn("-af", command)
+            self.assertEqual(command[command.index("-b:a") + 1], "320k")
+            self.assertTrue(target.is_file())
+            self.assertGreater(target.stat().st_size, 0)
+            self.assertEqual(run.call_args.kwargs["timeout"], 180)
 
     def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
         with tempfile.TemporaryDirectory() as directory:
