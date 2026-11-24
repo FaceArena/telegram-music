@@ -9,7 +9,6 @@ import time
 import tempfile
 import unittest
 
-import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,7 +19,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, _build_sub_bass, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_download_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -750,11 +749,8 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(callback.answers, [("❗ Время истекло. Выполните новый поиск.", True)])
 
-    async def test_track_pick_keeps_original_ten_results_message_unchanged(self):
+    async def test_track_pick_sends_original_immediately_with_inline_bass_button(self):
         picker = self.FakePicker()
-        original_text = picker.text
-        original_markup = object()
-        picker.reply_markup = original_markup
         callback = self.FakeCallback("pick:live-token:0", picker)
         state = {
             "chat_id": 123,
@@ -767,96 +763,19 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         ctx, bot_data = self.make_context(state)
         update = type("Update", (), {"callback_query": callback})()
 
-        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock:
+        with patch("main.process", new_callable=unittest.mock.AsyncMock, return_value=True) as process_mock:
             await on_pick(update, ctx)
 
-        self.assertEqual(picker.text, original_text)
-        self.assertIs(picker.reply_markup, original_markup)
-        self.assertEqual(len(picker.replies), 1)
-        prompt = picker.replies[0]
-        self.assertIn("Test song", prompt.text)
-        self.assertEqual(state["stage"], "bass")
+        self.assertEqual(state["stage"], "sent")
         self.assertEqual(state["selected_index"], 0)
-        self.assertEqual(state["bass_message_id"], prompt.message_id)
-        self.assertEqual(callback.answers, [(None, False)])
-        process_mock.assert_not_awaited()
-
-    async def test_bass_choice_only_prepares_download_confirmation(self):
-        original = self.FakePicker()
-        prompt = self.FakePicker(789, "🎵 Choose bass")
-        callback = self.FakeCallback("bass:live-token:0:boost", prompt)
-        state = {
-            "chat_id": 123,
-            "message_id": original.message_id,
-            "bass_message_id": prompt.message_id,
-            "created": time.time(),
-            "stage": "bass",
-            "selected_index": 0,
-            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
-        }
-        ctx, _ = self.make_context(state)
-        update = type("Update", (), {"callback_query": callback})()
-
-        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock:
-            await on_bass_pick(update, ctx)
-
-        self.assertEqual(state["selected_preset"], "boost")
-        self.assertIn("Test song", prompt.text)
-        self.assertIn("🔥", prompt.text)
-        buttons = [b for row in prompt.reply_markup.inline_keyboard for b in row]
-        self.assertTrue(any(b.callback_data == "download:live-token" for b in buttons))
-        self.assertTrue(any(b.callback_data == "basschange:live-token" for b in buttons))
-        process_mock.assert_not_awaited()
-
-    async def test_download_starts_only_after_explicit_confirmation(self):
-        prompt = self.FakePicker(789, "Ready to download")
-        callback = self.FakeCallback("download:live-token", prompt)
-        state = {
-            "chat_id": 123,
-            "message_id": 456,
-            "bass_message_id": prompt.message_id,
-            "created": time.time(),
-            "stage": "bass",
-            "selected_index": 0,
-            "selected_preset": "extreme",
-            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
-        }
-        ctx, bot_data = self.make_context(state)
-        update = type("Update", (), {"callback_query": callback})()
-
-        with patch("main.process", new_callable=unittest.mock.AsyncMock, return_value=True) as process_mock:
-            await on_download_pick(update, ctx)
-
+        self.assertEqual(state["selected_preset"], "original")
         process_mock.assert_awaited_once()
-        self.assertEqual(process_mock.await_args.kwargs["bass_preset"], "extreme")
-        self.assertEqual(callback.answers, [(None, False)])
-        self.assertIn("Трек отправлен", prompt.text)
+        self.assertEqual(process_mock.await_args.kwargs["bass_preset"], "original")
+        markup = process_mock.await_args.kwargs["reply_markup"]
+        button = markup.inline_keyboard[0][0]
+        self.assertEqual(button.text, "🔊 Добавить басс")
+        self.assertEqual(button.callback_data, "bassmenu:live-token:0")
         self.assertNotIn("live-token", bot_data["music_processing_tokens"])
-
-    async def test_back_returns_to_original_picker_without_new_search(self):
-        prompt = self.FakePicker(789, "Bass settings")
-        callback = self.FakeCallback("back:live-token", prompt)
-        state = {
-            "chat_id": 123,
-            "message_id": 456,
-            "bass_message_id": prompt.message_id,
-            "created": time.time(),
-            "stage": "bass",
-            "selected_index": 2,
-            "selected_preset": "boost",
-            "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "Test song"}],
-        }
-        ctx, _ = self.make_context(state)
-        update = type("Update", (), {"callback_query": callback})()
-
-        await on_picker_back(update, ctx)
-
-        self.assertTrue(prompt.deleted)
-        self.assertEqual(state["stage"], "select")
-        self.assertIsNone(state["selected_index"])
-        self.assertIsNone(state["selected_preset"])
-        self.assertIsNone(state["bass_message_id"])
-        self.assertEqual(state["message_id"], 456)
 
     async def test_duplicate_picker_click_does_not_release_existing_claim(self):
         picker = self.FakePicker()
@@ -1182,30 +1101,26 @@ class BassProcessingTests(unittest.TestCase):
         self.assertIn("bass=g=12.0:f=90", bass_filter_for_preset("extreme"))
         self.assertIn("alimiter=limit=0.95", bass_filter_for_preset("extreme"))
 
-    def test_real_sub_is_a_separate_synth_mode_not_an_eq_preset(self):
-        self.assertIsNone(bass_filter_for_preset("real_sub"))
-        sample_rate = 22050
-        t = np.arange(sample_rate * 2, dtype=np.float32) / sample_rate
-        source = (0.2 * np.sin(2 * np.pi * 55.0 * t)).astype(np.float32)
-        generated = _build_sub_bass(source, sample_rate)
-        self.assertEqual(generated.shape, source.shape)
-        self.assertGreater(float(np.max(np.abs(generated))), 0.05)
-        self.assertTrue(np.isfinite(generated).all())
-
     def test_unknown_preset_is_rejected(self):
         with self.assertRaises(ValueError):
             bass_filter_for_preset("maximum++")
 
-    def test_bass_keyboard_contains_five_presets_with_short_callback_data(self):
+    def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
         markup = build_bass_keyboard("0123456789abcdef", 9)
         buttons = [button for row in markup.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 6)
+        self.assertEqual(len(buttons), 4)
         self.assertEqual(
-            [button.callback_data.rsplit(":", 1)[-1] for button in buttons[:5]],
-            ["original", "bass", "boost", "extreme", "real_sub"],
+            [button.callback_data.rsplit(":", 1)[-1] for button in buttons],
+            ["original", "bass", "boost", "extreme"],
         )
-        self.assertEqual(buttons[5].callback_data, "back:0123456789abcdef")
         self.assertTrue(all(len(button.callback_data) <= 64 for button in buttons))
+
+    def test_audio_keyboard_has_inline_add_bass_button(self):
+        from main import build_audio_keyboard
+        buttons = [button for row in build_audio_keyboard("0123456789abcdef", 9).inline_keyboard for button in row]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].text, "🔊 Добавить басс")
+        self.assertEqual(buttons[0].callback_data, "bassmenu:0123456789abcdef:9")
 
     def test_apply_bass_boost_invokes_ffmpeg_and_validates_output(self):
         with tempfile.TemporaryDirectory() as directory:
