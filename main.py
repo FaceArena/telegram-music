@@ -159,7 +159,7 @@ async def log_runtime_metrics(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "cache_hit(search=%.1f%% track=%.1f%%) "
         "wait_p95_ms(search=%.1f download=%.1f send=%.1f) "
         "latency_p95_p99_ms(search=%.1f/%.1f process=%.1f/%.1f video=%.1f/%.1f) "
-        "errors(youtube_search=%d youtube_download=%d audd=%d ffmpeg=%d telegram=%d retry_after=%d) "
+        "errors(youtube_search=%d youtube_download=%d audd=%d ffmpeg=%d telegram_send=%d telegram_api=%d retry_after=%d) "
         "cpu_s=%.1f rss_peak_mb=%.1f disk_free_gb=%.2f",
         update_queue.qsize(), update_queue.maxsize,
         metrics.get("search_active", 0), metrics.get("process_active", 0),
@@ -177,7 +177,8 @@ async def log_runtime_metrics(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         metrics.get("youtube_search_errors", 0),
         metrics.get("youtube_download_errors", 0),
         metrics.get("audd_errors", 0), metrics.get("ffmpeg_errors", 0),
-        metrics.get("telegram_send_errors", 0), metrics.get("telegram_retry_after", 0),
+        metrics.get("telegram_send_errors", 0), metrics.get("telegram_api_errors", 0),
+        metrics.get("telegram_retry_after", 0),
         cpu_seconds, rss_peak_mb, disk_free_gb,
     )
 
@@ -906,10 +907,11 @@ async def show_search(
         # unrelated results are filtered before presenting the same 10-item picker.
         results = None if video_recognition else _safe_cache_call(CACHE, "get_search", nq)
         cache_hit = bool(results)
-        _metric_increment(
-            ctx.application.bot_data,
-            "search_cache_hits" if cache_hit else "search_cache_misses",
-        )
+        if not video_recognition:
+            _metric_increment(
+                ctx.application.bot_data,
+                "search_cache_hits" if cache_hit else "search_cache_misses",
+            )
         if cache_hit:
             log.info("КЭШ: поиск «%s» из кэша (%d результатов)", nq, len(results))
         else:
@@ -1237,8 +1239,12 @@ async def _process_video_pipeline(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         progress_message = await message.reply_text("🎧 Распознаю музыку в видео…")
         video_path = workdir / filename
         audio_path = workdir / "recognition-sample.mp3"
-        telegram_file = await ctx.bot.get_file(media.file_id)
-        await telegram_file.download_to_drive(custom_path=str(video_path))
+        try:
+            telegram_file = await ctx.bot.get_file(media.file_id)
+            await telegram_file.download_to_drive(custom_path=str(video_path))
+        except Exception:
+            _metric_increment(ctx.application.bot_data, "telegram_api_errors")
+            raise
         actual_size = video_path.stat().st_size
         if actual_size <= 0:
             raise RuntimeError("Downloaded video is empty")
