@@ -205,7 +205,7 @@ AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mp3").strip().lower()
 if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
-ERROR_NOTIFICATION_TTL = 15
+ERROR_NOTIFICATION_TTL = 10
 START_MESSAGE_TTL = 30
 AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()
 AUDD_API_URL = "https://api.audd.io/"
@@ -225,7 +225,7 @@ MAX_PARALLEL_VIDEO = _env_int("MAX_PARALLEL_VIDEO", 2, minimum=1)
 VIDEO_LOCK = asyncio.Semaphore(MAX_PARALLEL_VIDEO)
 MAX_PARALLEL_BASS = _env_int("MAX_PARALLEL_BASS", 2, minimum=1)
 BASS_LOCK = asyncio.Semaphore(MAX_PARALLEL_BASS)
-BASS_PRESETS = {"original": None, "bass": 5.0, "boost": 9.0, "extreme": 12.0}
+BASS_PRESETS = {"original": None, "bass": 12.0, "low_freq": 5.0}
 MAX_CONCURRENT_UPDATES = _env_int("MAX_CONCURRENT_UPDATES", 32, minimum=1)
 MAX_PENDING_UPDATES = _env_int("MAX_PENDING_UPDATES", 128, minimum=1)
 _last_finish = 0.0
@@ -891,55 +891,36 @@ def schedule_prefetch(ctx: ContextTypes.DEFAULT_TYPE, urls: list) -> None:
 
 
 async def _delete_error_later(bot, bot_data: dict, chat_id: int, message_id: int, delay: int):
+    """Delete each error independently; simultaneous errors keep independent TTLs."""
     await asyncio.sleep(delay)
-    active = bot_data.setdefault("_error_notifications", {})
-    locks = bot_data.setdefault("_error_notification_locks", {})
-    lock = locks.setdefault(chat_id, asyncio.Lock())
-    async with lock:
-        current = active.get(chat_id)
-        if not current or current.get("message_id") != message_id:
-            return
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception as exc:
-            log.debug("Не удалось удалить уведомление об ошибке %s: %s", message_id, exc)
-        finally:
-            # Clear only this notification; a newer one must never be removed.
-            if active.get(chat_id, {}).get("message_id") == message_id:
-                active.pop(chat_id, None)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        log.debug("Не удалось удалить уведомление об ошибке %s: %s", message_id, exc)
 
 
 async def send_generic_error(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
-    text: str = "⚠️ Произошла ошибка.",
+    text: str = "⚠️ Произошла ошибка. Попробуй ещё раз.",
 ):
     bot_data = ctx.application.bot_data
-    active = bot_data.setdefault("_error_notifications", {})
-    locks = bot_data.setdefault("_error_notification_locks", {})
-    lock = locks.setdefault(chat_id, asyncio.Lock())
+    try:
+        message = await ctx.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        _metric_increment(bot_data, "telegram_send_errors")
+        log.exception("Не удалось отправить сообщение об ошибке")
+        return
 
-    # Serialize simultaneous failures in the same chat. The first error owns
-    # the single notification and its 15-second lifetime.
-    async with lock:
-        if chat_id in active:
-            return
-        try:
-            message = await ctx.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            _metric_increment(bot_data, "telegram_send_errors")
-            log.exception("Не удалось отправить сообщение об ошибке")
-            return
-
-        active[chat_id] = {"message_id": message.message_id}
-        tasks = bot_data.setdefault("_cleanup_tasks", set())
-        task = asyncio.create_task(
-            _delete_error_later(
-                ctx.bot, bot_data, chat_id, message.message_id, ERROR_NOTIFICATION_TTL
-            )
+    # Every notification gets its own 10-second timer, including concurrent errors.
+    tasks = bot_data.setdefault("_cleanup_tasks", set())
+    task = asyncio.create_task(
+        _delete_error_later(
+            ctx.bot, bot_data, chat_id, message.message_id, ERROR_NOTIFICATION_TTL
         )
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+    )
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
 
 
 @_track_runtime_metric("search")
@@ -1000,7 +981,10 @@ async def show_search(
         if results and not cache_hit and not video_recognition:
             _safe_cache_call(CACHE, "put_search", nq, results)
         if not results:
-            await send_generic_error(ctx, chat_id)
+            await send_generic_error(
+                ctx, chat_id,
+                "🎵 Не удалось найти эту песню. Проверь название или попробуй отправить другое видео."
+            )
             return
 
         token = secrets.token_hex(8)
@@ -1468,10 +1452,8 @@ def build_audio_keyboard(token: str, index: int, label: str = "🔊 Добави
 
 def build_bass_keyboard(token: str, index: int) -> InlineKeyboardMarkup:
     options = [
-        ("🎵 Оригинал", "original"),
-        ("🔊 Bass", "bass"),
-        ("🔥 Bass Boost", "boost"),
-        ("💥 Extreme Bass", "extreme"),
+        ("🔥 Bass", "bass"),
+        ("🔊 Усилить низкие частоты", "low_freq"),
     ]
     buttons = [
         InlineKeyboardButton(label, callback_data=f"bassapply:{token}:{index}:{preset}")
@@ -1563,7 +1545,7 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data["selected_preset"] = None
             await send_generic_error(
                 ctx, picker.chat_id,
-                "⚠️ Не удалось отправить музыку. Выбери эту или другую версию ещё раз.",
+                "🎵 Не удалось найти или отправить эту версию. Попробуй выбрать другой вариант.",
             )
     except (ValueError, AttributeError, TypeError):
         if callback:
