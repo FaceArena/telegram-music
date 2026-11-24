@@ -8,6 +8,8 @@ import sqlite3
 import time
 import tempfile
 import unittest
+
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1194,7 +1196,7 @@ class BassProcessingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bass_filter_for_preset("maximum++")
 
-    def test_bass_keyboard_contains_four_presets_with_short_callback_data(self):
+    def test_bass_keyboard_contains_five_presets_with_short_callback_data(self):
         markup = build_bass_keyboard("0123456789abcdef", 9)
         buttons = [button for row in markup.inline_keyboard for button in row]
         self.assertEqual(len(buttons), 6)
