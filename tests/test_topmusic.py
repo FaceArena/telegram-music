@@ -18,7 +18,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, rank_search_results  # noqa: E402
+from main import _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_pick, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -710,8 +710,9 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             self.text = "🎵 Выбери трек:"
             self.reply_markup = None
 
-        async def edit_text(self, *args, **kwargs):
-            return None
+        async def edit_text(self, text, reply_markup=None):
+            self.text = text
+            self.reply_markup = reply_markup
 
     async def test_expired_picker_shows_telegram_alert_instead_of_chat_message(self):
         picker = self.FakePicker()
@@ -732,15 +733,18 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             [("❗ Время истекло. Выполните новый поиск.", True)],
         )
 
-    async def test_failed_music_delivery_is_reported_after_early_callback_ack(self):
+    async def test_failed_bass_delivery_is_reported_after_callback_ack(self):
         picker = self.FakePicker()
-        callback = self.FakeCallback("pick:live-token:0", picker)
+        picker.text = "🔊 Выбери обработку баса"
+        callback = self.FakeCallback("bass:live-token:0:boost", picker)
         bot_data = {
             "music_searches": {
                 "live-token": {
                     "chat_id": 123,
                     "message_id": 456,
                     "created": time.time(),
+                    "stage": "bass",
+                    "selected_index": 0,
                     "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
                 }
             },
@@ -756,6 +760,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
 
         async def failed_process(*args, **kwargs):
             self.assertEqual(callback.answers, [(None, False)])
+            self.assertEqual(kwargs["bass_preset"], "boost")
             return False
 
         with patch("main.process", side_effect=failed_process), patch(
@@ -763,16 +768,17 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         ) as notify, patch(
             "main._animate_picker", new_callable=unittest.mock.AsyncMock
         ) as animation:
-            await on_pick(update, ctx)
+            await on_bass_pick(update, ctx)
 
         self.assertEqual(callback.answers, [(None, False)])
         notify.assert_awaited_once_with(
-            ctx, 123, "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
+            ctx, 123,
+            "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
         )
         animation.assert_not_called()
 
 
-    async def test_callback_ack_failure_does_not_block_processing(self):
+    async def test_callback_ack_failure_still_displays_bass_menu(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
 
@@ -786,7 +792,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
                     "chat_id": 123,
                     "message_id": 456,
                     "created": time.time(),
-                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title":"Test song"}],
                 }
             },
             "music_processing_tokens": set(),
@@ -799,21 +805,15 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             "effective_chat": type("Chat", (), {"id": 123})(),
         })()
 
-        async def failed_process(*args, **kwargs):
-            return False
-
-        with patch("main.process", side_effect=failed_process), patch(
-            "main.send_generic_error", new_callable=unittest.mock.AsyncMock
-        ) as notify:
+        with patch("main.send_generic_error", new_callable=unittest.mock.AsyncMock) as notify:
             await on_pick(update, ctx)
 
-        notify.assert_awaited_once_with(
-            ctx,
-            123,
-            "⚠️ Не удалось отправить музыку. Попробуйте ещё раз.",
-        )
+        self.assertEqual(bot_data["music_searches"]["live-token"]["stage"], "bass")
+        self.assertIn("Test song", picker.text)
+        self.assertEqual(len(picker.reply_markup.inline_keyboard), 2)
+        notify.assert_not_awaited()
 
-    async def test_spinner_starts_only_after_process_admits_work(self):
+    async def test_track_pick_displays_bass_menu_without_downloading(self):
         picker = self.FakePicker()
         callback = self.FakeCallback("pick:live-token:0", picker)
         bot_data = {
@@ -822,6 +822,48 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
                     "chat_id": 123,
                     "message_id": 456,
                     "created": time.time(),
+                    "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk", "title":"Test song"}],
+                }
+            },
+            "music_processing_tokens": set(),
+        }
+        ctx = type("Context", (), {
+            "application": type("Application", (), {"bot_data": bot_data})(),
+        })()
+        update = type("Update", (), {
+            "callback_query": callback,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+
+        with patch("main.process", new_callable=unittest.mock.AsyncMock) as process_mock, patch(
+            "main._animate_picker", new_callable=unittest.mock.AsyncMock
+        ) as animation:
+            await on_pick(update, ctx)
+
+        self.assertEqual(callback.answers, [(None, False)])
+        self.assertIn("Test song", picker.text)
+        self.assertEqual(bot_data["music_searches"]["live-token"]["stage"], "bass")
+        self.assertEqual(bot_data["music_searches"]["live-token"]["selected_index"], 0)
+        self.assertEqual(
+            [b.callback_data.rsplit(":", 1)[-1] for row in picker.reply_markup.inline_keyboard for b in row],
+            ["original", "bass", "boost", "extreme"],
+        )
+        process_mock.assert_not_awaited()
+        animation.assert_not_awaited()
+        self.assertNotIn("live-token", bot_data["music_processing_tokens"])
+
+    async def test_spinner_starts_only_after_bass_process_admits_work(self):
+        picker = self.FakePicker()
+        picker.text = "🔊 Выбери обработку баса"
+        callback = self.FakeCallback("bass:live-token:0:boost", picker)
+        bot_data = {
+            "music_searches": {
+                "live-token": {
+                    "chat_id": 123,
+                    "message_id": 456,
+                    "created": time.time(),
+                    "stage": "bass",
+                    "selected_index": 0,
                     "results": [{"url": "https://www.youtube.com/watch?v=abcdefghijk"}],
                 }
             },
@@ -842,6 +884,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
 
         async def admitted_process(*args, **kwargs):
             self.assertEqual(callback.answers, [(None, False)])
+            self.assertEqual(kwargs["bass_preset"], "boost")
             self.assertFalse(animation_started.is_set())
             await kwargs["on_started"]()
             await asyncio.sleep(0)
@@ -851,7 +894,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.process", side_effect=admitted_process), patch(
             "main._animate_picker", side_effect=fake_animation
         ):
-            await on_pick(update, ctx)
+            await on_bass_pick(update, ctx)
 
         self.assertTrue(animation_started.is_set())
         self.assertNotIn("live-token", bot_data["music_processing_tokens"])
