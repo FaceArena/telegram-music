@@ -307,7 +307,9 @@ class Cache:
 
     @staticmethod
     def track_key(video_id: str) -> str:
-        return f"{video_id}:{AUDIO_FORMAT}"
+        # Versioned key invalidates Telegram file_ids created before the 320 kbps
+        # quality upgrade. Old rows remain unused; new requests re-download.
+        return f"{video_id}:{AUDIO_FORMAT}:q320-v2"
 
     def get_track(self, video_id: str):
         with self.lock:
