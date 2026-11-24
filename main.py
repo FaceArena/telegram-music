@@ -852,12 +852,17 @@ def schedule_delete(ctx: ContextTypes.DEFAULT_TYPE, message, delay: int):
 async def _expire_search_later(bot, searches: dict, token: str, chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
     state = searches.get(token)
+    bass_message_id = None
     if state and state.get("message_id") == message_id:
+        bass_message_id = state.get("bass_message_id")
         searches.pop(token, None)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as exc:
-        log.debug("Не удалось удалить список выбора %s: %s", message_id, exc)
+    for target_id in (message_id, bass_message_id):
+        if not target_id:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=target_id)
+        except Exception as exc:
+            log.debug("Не удалось удалить сообщение выбора %s: %s", target_id, exc)
 
 
 def schedule_search_expiry(ctx: ContextTypes.DEFAULT_TYPE, message, token: str, delay: int = 600):
@@ -1459,12 +1464,24 @@ def build_bass_keyboard(token: str, index: int) -> InlineKeyboardMarkup:
         ("💥 Extreme Bass", "extreme"),
     ]
     buttons = [
-        InlineKeyboardButton(
-            label, callback_data=f"bass:{token}:{index}:{preset}"
-        )
+        InlineKeyboardButton(label, callback_data=f"bass:{token}:{index}:{preset}")
         for label, preset in options
     ]
-    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
+    return InlineKeyboardMarkup([
+        buttons[:2],
+        buttons[2:],
+        [InlineKeyboardButton("↩️ Другая версия", callback_data=f"back:{token}")],
+    ])
+
+
+def build_download_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬇️ Скачать выбранный трек", callback_data=f"download:{token}")],
+        [
+            InlineKeyboardButton("🎚 Изменить бас", callback_data=f"basschange:{token}"),
+            InlineKeyboardButton("↩️ Другая версия", callback_data=f"back:{token}"),
+        ],
+    ])
 
 
 def _claim_processing(processing_tokens: set, token: str) -> bool:
@@ -1492,158 +1509,228 @@ def _get_search_state(searches: dict, token: str, chat_id: int):
 
 @_track_runtime_metric("picker")
 async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Select a search result without replacing the original 10-track picker."""
     callback = update.callback_query
-    processing_tokens = None
     token = None
-    picker = None
-    anim = None
+    picker = callback.message if callback else None
     claimed = False
+    processing_tokens = None
     try:
         _, token, raw_index = callback.data.split(":")
         index = int(raw_index)
-        picker = callback.message
         if not picker:
             await callback.answer()
             return
 
         searches = ctx.application.bot_data.setdefault("music_searches", {})
         data = _get_search_state(searches, token, picker.chat_id)
-        if not data or (data.get("message_id") is not None and data["message_id"] != picker.message_id):
-            await callback.answer(
-                "❗ Время истекло. Выполните новый поиск.",
-                show_alert=True,
-            )
+        if not data or data.get("message_id") != picker.message_id:
+            await callback.answer("❗ Время истекло. Выполните новый поиск.", show_alert=True)
             return
-
         results = data.get("results") or []
         if index < 0 or index >= len(results):
-            await callback.answer(
-                "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
-                show_alert=True,
-            )
+            await callback.answer("⚠️ Не удалось выбрать трек. Выполните поиск ещё раз.", show_alert=True)
             return
 
-        if data.get("stage") == "bass":
-            await callback.answer("Сначала выбери обработку баса.", show_alert=True)
-            return
-
-        selected = results[index]
         processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
-        # The set is application-wide, so two group members cannot race the same picker.
         if not _claim_processing(processing_tokens, token):
-            await callback.answer()
+            await callback.answer("⏳ Подожди, текущий трек ещё обрабатывается.")
             return
         claimed = True
+        await callback.answer()
 
-        # Acknowledge the Telegram callback before any download/network wait.
-        # Telegram expires unanswered callback queries while long-running work continues.
-        try:
-            await callback.answer()
-        except Exception as exc:
-            log.debug("Не удалось подтвердить callback до обработки: %s", exc)
-
+        selected = results[index]
         title = clean_metadata(selected.get("title"), 120) or "Без названия"
-        edited_picker = await picker.edit_text(
-            f"🔊 Выбери обработку баса для трека:\n\n{title}",
-            reply_markup=build_bass_keyboard(token, index),
-        )
-        if edited_picker:
-            picker = edited_picker
         data["stage"] = "bass"
         data["selected_index"] = index
-    except (ValueError, AttributeError, TypeError):
-        if claimed and picker:
-            await send_generic_error(
-                ctx, picker.chat_id,
-                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
-            )
-        elif callback:
+        data["selected_preset"] = None
+        prompt = (
+            f"🎵 Выбрана версия {index + 1} из {len(results)}:\n"
+            f"{title}\n\n"
+            "Теперь выбери обработку баса. Список из 10 версий останется выше — "
+            "можно вернуться и выбрать другую."
+        )
+        bass_message_id = data.get("bass_message_id")
+        if bass_message_id:
             try:
-                await callback.answer(
-                    "⚠️ Не удалось отправить музыку. Попробуйте выполнить поиск ещё раз.",
-                    show_alert=True,
+                await ctx.bot.edit_message_text(
+                    chat_id=picker.chat_id,
+                    message_id=bass_message_id,
+                    text=prompt,
+                    reply_markup=build_bass_keyboard(token, index),
                 )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
+        else:
+            bass_message = await picker.reply_text(
+                prompt,
+                reply_markup=build_bass_keyboard(token, index),
+            )
+            data["bass_message_id"] = bass_message.message_id
+    except (ValueError, AttributeError, TypeError):
+        if callback:
+            try:
+                await callback.answer("⚠️ Не удалось обработать выбор. Выполните поиск ещё раз.", show_alert=True)
             except Exception:
                 pass
     except Exception:
-        log.exception("Ошибка обработки выбора трека")
+        log.exception("Ошибка выбора версии трека")
         if picker:
-            await send_generic_error(
-                ctx, picker.chat_id,
-                "⚠️ Не удалось отправить музыку. Попробуйте ещё раз."
-            )
+            await send_generic_error(ctx, picker.chat_id, "⚠️ Не удалось открыть настройки трека. Попробуйте ещё раз.")
     finally:
-        if anim:
-            anim.cancel()
-            try:
-                await anim
-            except (asyncio.CancelledError, Exception):
-                pass
-            try:  # вернуть окно выбора в исходный вид
-                await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
-            except Exception as exc:
-                log.debug("Не удалось восстановить окно выбора: %s", exc)
         if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
 
 
-
 @_track_runtime_metric("picker")
 async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Choose a bass preset; downloading is a separate explicit action."""
     callback = update.callback_query
-    processing_tokens = None
     token = None
-    picker = None
-    anim = None
-    claimed = False
+    prompt = callback.message if callback else None
     try:
         _, token, raw_index, preset = callback.data.split(":")
         index = int(raw_index)
-        picker = callback.message
-        if not picker:
+        if not prompt:
             await callback.answer()
             return
-
         searches = ctx.application.bot_data.setdefault("music_searches", {})
-        data = _get_search_state(searches, token, picker.chat_id)
+        data = _get_search_state(searches, token, prompt.chat_id)
         if (
             not data
-            or data.get("message_id") != picker.message_id
             or data.get("stage") != "bass"
+            or data.get("bass_message_id") != prompt.message_id
             or data.get("selected_index") != index
         ):
-            await callback.answer(
-                "❗ Время истекло. Выполните новый поиск.",
-                show_alert=True,
-            )
+            await callback.answer("❗ Выбор устарел. Нажми на нужную версию ещё раз.", show_alert=True)
             return
         if preset not in BASS_PRESETS:
             await callback.answer("⚠️ Неизвестный режим обработки.", show_alert=True)
             return
 
-        results = data.get("results") or []
-        if index < 0 or index >= len(results):
-            await callback.answer("⚠️ Выполните поиск ещё раз.", show_alert=True)
-            return
+        data["selected_preset"] = preset
+        await callback.answer("Режим выбран")
+        selected = data["results"][index]
+        title = clean_metadata(selected.get("title"), 120) or "Без названия"
+        preset_labels = {
+            "original": "🎵 Оригинал",
+            "bass": "🔊 Bass",
+            "boost": "🔥 Bass Boost",
+            "extreme": "💥 Extreme Bass",
+        }
+        await prompt.edit_text(
+            f"✅ Всё готово к скачиванию\n\n{title}\nОбработка: {preset_labels[preset]}\n\n"
+            "Проверь версию. Если всё верно — скачивай. Если нет, вернись к 10 вариантам.",
+            reply_markup=build_download_keyboard(token),
+        )
+    except (ValueError, AttributeError, TypeError, IndexError):
+        if callback:
+            await callback.answer("⚠️ Не удалось выбрать обработку. Попробуй ещё раз.", show_alert=True)
+    except Exception:
+        log.exception("Ошибка выбора обработки баса")
+        if prompt:
+            await send_generic_error(ctx, prompt.chat_id, "⚠️ Не удалось сохранить настройки трека.")
 
+
+async def on_bass_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    callback = update.callback_query
+    prompt = callback.message if callback else None
+    try:
+        _, token = callback.data.split(":")
+        if not prompt:
+            await callback.answer()
+            return
+        data = _get_search_state(
+            ctx.application.bot_data.setdefault("music_searches", {}),
+            token,
+            prompt.chat_id,
+        )
+        if not data or data.get("bass_message_id") != prompt.message_id or data.get("stage") != "bass":
+            await callback.answer("❗ Время выбора истекло.", show_alert=True)
+            return
+        index = data.get("selected_index")
+        data["selected_preset"] = None
+        selected = data["results"][index]
+        title = clean_metadata(selected.get("title"), 120) or "Без названия"
+        await callback.answer()
+        await prompt.edit_text(
+            f"🎵 {title}\n\nВыбери обработку баса:",
+            reply_markup=build_bass_keyboard(token, index),
+        )
+    except Exception:
+        log.exception("Ошибка возврата к выбору баса")
+        if callback:
+            await callback.answer("⚠️ Не удалось открыть настройки.", show_alert=True)
+
+
+async def on_picker_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Close the settings prompt and return to the untouched 10-result list."""
+    callback = update.callback_query
+    prompt = callback.message if callback else None
+    try:
+        _, token = callback.data.split(":")
+        if not prompt:
+            await callback.answer()
+            return
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        data = _get_search_state(searches, token, prompt.chat_id)
+        if not data or data.get("bass_message_id") != prompt.message_id:
+            await callback.answer("❗ Время выбора истекло.", show_alert=True)
+            return
+        data["stage"] = "select"
+        data["selected_index"] = None
+        data["selected_preset"] = None
+        data["bass_message_id"] = None
+        await callback.answer("Возвращаю к 10 версиям")
+        await prompt.delete()
+    except Exception:
+        log.exception("Ошибка возврата к списку версий")
+        if callback:
+            await callback.answer("⚠️ Не удалось вернуться к списку.", show_alert=True)
+
+
+@_track_runtime_metric("picker")
+async def on_download_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Download only after the user confirms the exact version and bass preset."""
+    callback = update.callback_query
+    token = None
+    prompt = callback.message if callback else None
+    anim = None
+    claimed = False
+    processing_tokens = None
+    try:
+        _, token = callback.data.split(":")
+        if not prompt:
+            await callback.answer()
+            return
+        searches = ctx.application.bot_data.setdefault("music_searches", {})
+        data = _get_search_state(searches, token, prompt.chat_id)
+        if (
+            not data
+            or data.get("stage") != "bass"
+            or data.get("bass_message_id") != prompt.message_id
+            or data.get("selected_index") is None
+            or data.get("selected_preset") not in BASS_PRESETS
+        ):
+            await callback.answer("Сначала выбери версию и обработку баса.", show_alert=True)
+            return
         processing_tokens = ctx.application.bot_data.setdefault("music_processing_tokens", set())
         if not _claim_processing(processing_tokens, token):
-            await callback.answer()
+            await callback.answer("⏳ Трек уже обрабатывается.")
             return
         claimed = True
+        await callback.answer()
 
-        try:
-            await callback.answer()
-        except Exception as exc:
-            log.debug("Не удалось подтвердить callback перед обработкой баса: %s", exc)
+        index = data["selected_index"]
+        preset = data["selected_preset"]
+        selected = data["results"][index]
 
         async def start_animation():
             nonlocal anim
             if anim is None:
-                option_index = ["original", "bass", "boost", "extreme"].index(preset)
-                anim = asyncio.create_task(_animate_picker(picker, option_index))
+                anim = asyncio.create_task(_animate_picker(prompt, 0))
 
-        selected = results[index]
         delivered = await process(
             update,
             ctx,
@@ -1652,32 +1739,25 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             on_started=start_animation,
             bass_preset=preset,
         )
-        if not delivered:
+        if delivered:
+            await prompt.edit_text(
+                "✅ Трек отправлен!\n\nМожешь выбрать другую версию в списке из 10 вариантов выше.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Выбрать другую версию", callback_data=f"back:{token}")
+                ]]),
+            )
+        else:
             await send_generic_error(
-                ctx, picker.chat_id,
-                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
+                ctx, prompt.chat_id,
+                "⚠️ Не удалось обработать или отправить музыку. Попробуй скачать ещё раз.",
             )
     except (ValueError, AttributeError, TypeError):
-        if claimed and picker:
-            await send_generic_error(
-                ctx, picker.chat_id,
-                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
-            )
-        elif callback:
-            try:
-                await callback.answer(
-                    "⚠️ Не удалось обработать выбор. Выполните поиск ещё раз.",
-                    show_alert=True,
-                )
-            except Exception:
-                pass
+        if callback:
+            await callback.answer("⚠️ Не удалось начать скачивание. Попробуй ещё раз.", show_alert=True)
     except Exception:
-        log.exception("Ошибка обработки выбора баса")
-        if picker:
-            await send_generic_error(
-                ctx, picker.chat_id,
-                "⚠️ Не удалось обработать или отправить музыку. Попробуйте ещё раз.",
-            )
+        log.exception("Ошибка подтверждения скачивания")
+        if prompt:
+            await send_generic_error(ctx, prompt.chat_id, "⚠️ Не удалось обработать или отправить музыку.")
     finally:
         if anim:
             anim.cancel()
@@ -1685,10 +1765,6 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await anim
             except (asyncio.CancelledError, Exception):
                 pass
-            try:
-                await picker.edit_text(picker.text, reply_markup=picker.reply_markup)
-            except Exception as exc:
-                log.debug("Не удалось восстановить меню баса: %s", exc)
         if claimed and processing_tokens is not None and token is not None:
             _release_processing(processing_tokens, token)
 
@@ -1874,6 +1950,9 @@ def main():
     app.add_handler(CommandHandler("topmusic", cmd_topmusic))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_bass_pick, pattern=r"^bass:"))
+    app.add_handler(CallbackQueryHandler(on_bass_change, pattern=r"^basschange:"))
+    app.add_handler(CallbackQueryHandler(on_picker_back, pattern=r"^back:"))
+    app.add_handler(CallbackQueryHandler(on_download_pick, pattern=r"^download:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     if app.job_queue:
