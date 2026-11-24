@@ -721,6 +721,10 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
             self.reply_markup = reply_markup
             return self
 
+        async def edit_reply_markup(self, reply_markup=None):
+            self.reply_markup = reply_markup
+            return self
+
         async def reply_text(self, text, reply_markup=None):
             type(self).next_id += 1
             message = type(self)(type(self).next_id, text, reply_markup)
@@ -777,6 +781,83 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.text, "🔊 Добавить басс")
         self.assertEqual(button.callback_data, "bassmenu:live-token:0")
         self.assertNotIn("live-token", bot_data["music_processing_tokens"])
+
+    async def test_old_audio_message_keeps_its_own_bass_menu_after_another_version_is_picked(self):
+        audio = self.FakePicker(message_id=900)
+        audio.audio = object()
+        callback = self.FakeCallback("bassmenu:live-token:0", audio)
+        state = {
+            "chat_id": 123,
+            "created": time.time(),
+            "stage": "sent",
+            "selected_index": 1,
+            "results": [
+                {"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "First"},
+                {"url": "https://www.youtube.com/watch?v=abcdefghijl", "title": "Second"},
+            ],
+        }
+        ctx, _ = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
+
+        await on_bass_menu(update, ctx)
+
+        self.assertEqual(callback.answers, [(None, False)])
+        buttons = [button for row in audio.reply_markup.inline_keyboard for button in row]
+        self.assertEqual([button.callback_data for button in buttons], [
+            "bassapply:live-token:0:low_freq",
+            "bassapply:live-token:0:bass",
+        ])
+
+    async def test_old_audio_message_can_still_apply_bass_after_another_version_is_picked(self):
+        audio = self.FakePicker(message_id=901)
+        audio.audio = object()
+        callback = self.FakeCallback("bassapply:live-token:0:bass", audio)
+        state = {
+            "chat_id": 123,
+            "created": time.time(),
+            "stage": "sent",
+            "selected_index": 1,
+            "results": [
+                {"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "First"},
+                {"url": "https://www.youtube.com/watch?v=abcdefghijl", "title": "Second"},
+            ],
+        }
+        ctx, _ = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
+
+        with patch("main.process", new_callable=unittest.mock.AsyncMock, return_value=True) as process_mock:
+            await on_bass_pick(update, ctx)
+
+        process_mock.assert_awaited_once()
+        self.assertEqual(
+            process_mock.await_args.args[2],
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        self.assertEqual(process_mock.await_args.kwargs["bass_preset"], "bass")
+        self.assertEqual(callback.answers, [("Применяю обработку…", False)])
+
+    async def test_out_of_range_audio_button_is_rejected(self):
+        audio = self.FakePicker(message_id=902)
+        audio.audio = object()
+        callback = self.FakeCallback("bassmenu:live-token:9", audio)
+        state = {
+            "chat_id": 123,
+            "created": time.time(),
+            "stage": "sent",
+            "selected_index": 1,
+            "results": [
+                {"url": "https://www.youtube.com/watch?v=abcdefghijk", "title": "First"},
+                {"url": "https://www.youtube.com/watch?v=abcdefghijl", "title": "Second"},
+            ],
+        }
+        ctx, _ = self.make_context(state)
+        update = type("Update", (), {"callback_query": callback})()
+
+        await on_bass_menu(update, ctx)
+
+        self.assertEqual(callback.answers, [
+            ("❗ Эта кнопка уже устарела. Выбери песню заново.", True)
+        ])
 
     async def test_duplicate_picker_click_does_not_release_existing_claim(self):
         picker = self.FakePicker()
