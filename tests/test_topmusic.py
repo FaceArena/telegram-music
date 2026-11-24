@@ -973,7 +973,7 @@ class SearchRelevanceRankingTests(unittest.TestCase):
 
 
 class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
-    async def test_start_shows_only_channel_subscription_button(self):
+    async def test_start_sends_greeting_then_one_channel_invite(self):
         from main import cmd_start
 
         message = type("Message", (), {
@@ -986,12 +986,20 @@ class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
 
         await cmd_start(update, ctx)
 
-        message.reply_text.assert_awaited_once()
-        args, kwargs = message.reply_text.await_args
-        self.assertIn("Помоги нашему проекту расти", args[0])
-        markup = kwargs["reply_markup"]
+        self.assertEqual(message.reply_text.await_count, 2)
+        greeting_call, invite_call = message.reply_text.await_args_list
+
+        greeting_args, greeting_kwargs = greeting_call
+        self.assertIn("Привет!", greeting_args[0])
+        self.assertIn("название песни", greeting_args[0])
+        self.assertNotIn("reply_markup", greeting_kwargs)
+
+        invite_args, invite_kwargs = invite_call
+        self.assertIn("Помоги нашему проекту расти", invite_args[0])
+        markup = invite_kwargs["reply_markup"]
         buttons = [button for row in markup.inline_keyboard for button in row]
         self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].text, "📢 Подписаться на канал")
         self.assertEqual(buttons[0].url, "https://t.me/LunaAiroll")
         self.assertIsNone(buttons[0].callback_data)
 

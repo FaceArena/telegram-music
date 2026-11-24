@@ -1510,7 +1510,17 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
+    message = update.effective_message
+
+    # Сначала отдельное приветствие и краткая инструкция по использованию бота.
+    await message.reply_text(
+        "Привет! 👋\n\n"
+        "Отправь мне название песни или ссылку на YouTube — "
+        "я найду музыку и пришлю её тебе. 🎵"
+    )
+
+    # Единственное приглашение подписаться показывается только при /start.
+    await message.reply_text(
         "💙 Помоги нашему проекту расти!\n\n"
         "Подпишись на Telegram-канал и поддержи нашу работу.\n\n"
         "✨ Подписка необязательна — ботом можно пользоваться и без неё.",
