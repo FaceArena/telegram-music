@@ -964,14 +964,32 @@ class StartChannelInviteTests(unittest.IsolatedAsyncioTestCase):
         from main import cmd_start
 
         message = type("Message", (), {
-            "reply_text": unittest.mock.AsyncMock()
+            "reply_text": unittest.mock.AsyncMock(
+                side_effect=[
+                    type("SentMessage", (), {"message_id": 11})(),
+                    type("SentMessage", (), {"message_id": 12})(),
+                ]
+            )
         })()
-        update = type("Update", (), {"effective_message": message})()
+        update = type("Update", (), {
+            "effective_message": message,
+            "effective_chat": type("Chat", (), {"id": 123})(),
+        })()
+        job_queue = type("JobQueue", (), {
+            "run_once": unittest.mock.Mock()
+        })()
         ctx = type("Context", (), {
-            "bot": type("Bot", (), {"username": "music_test_bot"})()
+            "bot": type("Bot", (), {"username": "music_test_bot"})(),
+            "job_queue": job_queue,
         })()
 
         await cmd_start(update, ctx)
+        job_queue.run_once.assert_called_once()
+        self.assertEqual(job_queue.run_once.call_args.kwargs["when"], 30)
+        self.assertEqual(
+            job_queue.run_once.call_args.kwargs["data"],
+            {"chat_id": 123, "message_ids": [11, 12]},
+        )
 
         self.assertEqual(message.reply_text.await_count, 2)
         greeting_call, invite_call = message.reply_text.await_args_list
