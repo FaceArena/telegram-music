@@ -189,7 +189,7 @@ MAX_DURATION = _env_int("MAX_DURATION", 1200, minimum=1)
 # Small configurable cooldown; no multi-second artificial wait by default.
 MIN_DELAY = _env_float("MIN_DELAY", 0.0, minimum=0.0)
 MAX_DELAY = max(MIN_DELAY, _env_float("MAX_DELAY", 0.0, minimum=0.0))
-AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
+AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "320")
 GROUP_REACT_ALL = os.getenv("GROUP_REACT_ALL", "0") == "1"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "").strip()
 UPDATE_EVERY_HOURS = _env_int("UPDATE_EVERY_HOURS", 12, minimum=1)
@@ -615,7 +615,7 @@ STRATEGIES = build_strategies()
 
 def _ydl_options(workdir: Path, use_cookies: bool, clients: list):
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio/best",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -730,9 +730,9 @@ def _apply_bass_boost(input_path: Path, output_path: Path, preset: str) -> None:
     if audio_filter is None:
         raise ValueError("original preset does not require FFmpeg processing")
     if AUDIO_FORMAT == "m4a":
-        codec_args = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+        codec_args = ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"]
     else:
-        codec_args = ["-c:a", "libmp3lame", "-q:a", "2"]
+        codec_args = ["-c:a", "libmp3lame", "-b:a", "320k"]
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", str(input_path), "-map", "0:a:0", "-vn",
