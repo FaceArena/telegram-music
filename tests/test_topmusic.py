@@ -713,6 +713,7 @@ class PickerAlertTests(unittest.IsolatedAsyncioTestCase):
         async def edit_text(self, text, reply_markup=None):
             self.text = text
             self.reply_markup = reply_markup
+            return self
 
     async def test_expired_picker_shows_telegram_alert_instead_of_chat_message(self):
         picker = self.FakePicker()
