@@ -205,6 +205,7 @@ if AUDIO_FORMAT not in ("mp3", "m4a"):
     AUDIO_FORMAT = "mp3"
 TG_LIMIT = 49 * 1024 * 1024
 ERROR_NOTIFICATION_TTL = 15
+START_MESSAGE_TTL = 30
 AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()
 AUDD_API_URL = "https://api.audd.io/"
 MAX_VIDEO_RECOGNITION_SIZE = 20 * 1024 * 1024
@@ -1692,18 +1693,44 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _release_processing(processing_tokens, token)
 
 
+async def _delete_start_messages(bot, chat_id: int, message_ids: list[int]) -> None:
+    """Удаляет только приветствие и приглашение из конкретного вызова /start."""
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except BadRequest as exc:
+            # Пользователь мог удалить сообщение сам или оно уже могло исчезнуть.
+            log.debug("Не удалось удалить стартовое сообщение %s: %s", message_id, exc)
+        except Exception:
+            log.exception("Ошибка автоудаления стартового сообщения %s", message_id)
+
+
+async def delete_start_messages_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    data = ctx.job.data or {}
+    await _delete_start_messages(
+        ctx.bot, data["chat_id"], data.get("message_ids", [])
+    )
+
+
+async def _delete_start_messages_after_delay(bot, chat_id: int, message_ids: list[int]) -> None:
+    await asyncio.sleep(START_MESSAGE_TTL)
+    await _delete_start_messages(bot, chat_id, message_ids)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
+    sent_messages = []
 
     # Сначала отдельное приветствие и краткая инструкция по использованию бота.
-    await message.reply_text(
+    welcome = await message.reply_text(
         "Привет! 👋\n\n"
         "Отправь мне название песни или ссылку на YouTube — "
         "я найду музыку и пришлю её тебе. 🎵"
     )
+    sent_messages.append(welcome.message_id)
 
     # Единственное приглашение подписаться показывается только при /start.
-    await message.reply_text(
+    subscription = await message.reply_text(
         "💙 Помоги нашему проекту расти!\n\n"
         "Подпишись на Telegram-канал и поддержи нашу работу.\n\n"
         "✨ Подписка необязательна — ботом можно пользоваться и без неё.",
@@ -1711,6 +1738,27 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/LunaAiroll")
         ]]),
     )
+    sent_messages.append(subscription.message_id)
+
+    # Удаляем оба сообщения через 30 секунд, не затрагивая команды и музыку.
+    payload = {
+        "chat_id": message.chat_id,
+        "message_ids": sent_messages,
+    }
+    if ctx.job_queue:
+        ctx.job_queue.run_once(
+            delete_start_messages_job,
+            when=START_MESSAGE_TTL,
+            data=payload,
+            name=f"delete-start-{message.chat_id}-{message.message_id}",
+        )
+    else:
+        # JobQueue может отсутствовать в минимальной установке PTB.
+        ctx.application.create_task(
+            _delete_start_messages_after_delay(
+                ctx.bot, message.chat_id, sent_messages
+            )
+        )
 
 
 async def cmd_topmusic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
