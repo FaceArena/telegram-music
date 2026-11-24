@@ -1609,9 +1609,13 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await callback.answer("⚠️ Неизвестный режим обработки.", show_alert=True)
             return
 
+        results = data.get("results") or []
+        if index < 0 or index >= len(results):
+            await callback.answer("⚠️ Выбранная версия больше недоступна.", show_alert=True)
+            return
         data["selected_preset"] = preset
         await callback.answer("Режим выбран")
-        selected = data["results"][index]
+        selected = results[index]
         title = clean_metadata(selected.get("title"), 120) or "Без названия"
         preset_labels = {
             "original": "🎵 Оригинал",
@@ -1650,8 +1654,12 @@ async def on_bass_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await callback.answer("❗ Время выбора истекло.", show_alert=True)
             return
         index = data.get("selected_index")
+        results = data.get("results") or []
+        if index is None or index < 0 or index >= len(results):
+            await callback.answer("Сначала выбери версию из списка.", show_alert=True)
+            return
         data["selected_preset"] = None
-        selected = data["results"][index]
+        selected = results[index]
         title = clean_metadata(selected.get("title"), 120) or "Без названия"
         await callback.answer()
         await prompt.edit_text(
@@ -1724,7 +1732,11 @@ async def on_download_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         index = data["selected_index"]
         preset = data["selected_preset"]
-        selected = data["results"][index]
+        results = data.get("results") or []
+        if index < 0 or index >= len(results):
+            await callback.answer("Выбранная версия устарела. Запусти поиск заново.", show_alert=True)
+            return
+        selected = results[index]
         confirmation_text = prompt.text
         confirmation_markup = prompt.reply_markup
 
