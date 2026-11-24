@@ -1542,10 +1542,12 @@ async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.debug("Не удалось подтвердить callback до обработки: %s", exc)
 
         title = clean_metadata(selected.get("title"), 120) or "Без названия"
-        await picker.edit_text(
+        edited_picker = await picker.edit_text(
             f"🔊 Выбери обработку баса для трека:\n\n{title}",
             reply_markup=build_bass_keyboard(token, index),
         )
+        if edited_picker:
+            picker = edited_picker
         data["stage"] = "bass"
         data["selected_index"] = index
     except (ValueError, AttributeError, TypeError):
