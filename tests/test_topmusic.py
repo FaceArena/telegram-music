@@ -19,7 +19,7 @@ from telegram.ext import Application
 # main.py reads BOT_TOKEN at import time; no real Telegram token is needed for Cache tests.
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 
-from main import AUDIO_FORMAT, _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, _encode_audio, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
+from main import AUDIO_FORMAT, _metric_increment, _metric_observe, _percentile, _track_runtime_metric, log_runtime_metrics, MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, ERROR_NOTIFICATION_TTL, Cache, _claim_processing, _get_search_state, _is_invalid_file_id_error, _record_successful_delivery, _release_processing, _safe_cache_call, _send_audio_limited, _env_float, _env_int, bass_filter_for_preset, build_bass_keyboard, _apply_bass_boost, _encode_audio, _ydl_options, _download, clean_metadata, is_duration_over_limit, is_youtube_url, load_cookies, schedule_prefetch, strip_bot_mention, send_generic_error, update_ytdlp, on_pick, on_bass_menu, on_bass_pick, on_picker_back, build_download_keyboard, rank_search_results  # noqa: E402
 
 
 class TopMusicRankingTests(unittest.TestCase):
@@ -1195,6 +1195,52 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cache_hit(search=%.1f%%", message)
         self.assertEqual(args[7], 75.0)
         self.assertIn("rss_peak_mb=%.1f", message)
+
+
+class DownloadWithoutIntermediateTranscodeTests(unittest.TestCase):
+    def test_ytdlp_does_not_configure_audio_extraction_postprocessor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = _ydl_options(Path(directory), False, ["web"])
+
+        self.assertNotIn("postprocessors", options)
+        self.assertNotIn("postprocessor_args", options)
+        self.assertEqual(options["format"], "bestaudio/best")
+
+    def test_download_returns_original_audio_extension_for_final_encoder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+
+            class FakeYoutubeDL:
+                def __init__(self, options):
+                    self.options = options
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def extract_info(self, target, download=True):
+                    output = self.options["outtmpl"].replace(
+                        "%(id)s.%(ext)s", "abcdefghijk.webm"
+                    )
+                    Path(output).write_bytes(b"source-webm-audio")
+                    return {
+                        "id": "abcdefghijk",
+                        "title": "Test track",
+                        "ext": "webm",
+                    }
+
+            with patch("main.yt_dlp.YoutubeDL", FakeYoutubeDL):
+                info, source = _download(
+                    "https://www.youtube.com/watch?v=abcdefghijk",
+                    True, workdir, False, ["web"],
+                )
+
+            self.assertEqual(info["id"], "abcdefghijk")
+            self.assertIsNotNone(source)
+            self.assertEqual(source.suffix, ".webm")
+            self.assertEqual(source.read_bytes(), b"source-webm-audio")
 
 
 class BassProcessingTests(unittest.TestCase):
