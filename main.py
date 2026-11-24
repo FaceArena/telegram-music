@@ -1592,17 +1592,19 @@ async def on_bass_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             token,
             audio_message.chat_id,
         )
+        results = data.get("results") or [] if data else []
         if (
             not data
             or data.get("stage") != "sent"
             or not audio_message.audio
-            or data.get("selected_index") != index
+            or index < 0
+            or index >= len(results)
         ):
             await callback.answer("❗ Эта кнопка уже устарела. Выбери песню заново.", show_alert=True)
             return
         await callback.answer()
         await audio_message.edit_reply_markup(
-            reply_markup=build_bass_keyboard(token, data["selected_index"])
+            reply_markup=build_bass_keyboard(token, index)
         )
     except Exception:
         log.exception("Ошибка открытия меню баса")
@@ -1629,11 +1631,13 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             token,
             audio_message.chat_id,
         )
+        results = data.get("results") or [] if data else []
         if (
             not data
             or data.get("stage") != "sent"
-            or data.get("selected_index") != index
             or not audio_message.audio
+            or index < 0
+            or index >= len(results)
         ):
             await callback.answer("❗ Эта настройка устарела. Выбери песню заново.", show_alert=True)
             return
@@ -1647,7 +1651,7 @@ async def on_bass_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         claimed = True
         await callback.answer("Применяю обработку…")
-        selected = (data.get("results") or [])[index]
+        selected = results[index]
         await audio_message.edit_reply_markup(reply_markup=None)
         data["selected_preset"] = preset
         delivered = await process(
