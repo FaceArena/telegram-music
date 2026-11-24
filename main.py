@@ -1840,7 +1840,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Удаляем оба сообщения через 30 секунд, не затрагивая команды и музыку.
     payload = {
-        "chat_id": message.chat.id,
+        "chat_id": update.effective_chat.id,
         "message_ids": sent_messages,
     }
     if ctx.job_queue:
