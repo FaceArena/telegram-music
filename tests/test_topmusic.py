@@ -1039,12 +1039,16 @@ class AudioSendLimitsTests(unittest.IsolatedAsyncioTestCase):
 
         audio = FakeAudio()
         bot = FakeBot()
+        metrics = {}
         with patch("main.asyncio.sleep", new_callable=unittest.mock.AsyncMock) as sleep:
-            result = await _send_audio_limited(bot, chat_id=123, audio=audio)
+            result = await _send_audio_limited(
+                bot, metrics=metrics, chat_id=123, audio=audio
+            )
 
         self.assertEqual(result, "sent")
         self.assertEqual(bot.calls, 2)
         self.assertEqual(audio.positions, [0])
+        self.assertEqual(metrics["_runtime_metrics"]["telegram_retry_after"], 1)
         sleep.assert_awaited_once_with(0.51)
 
 
@@ -1074,11 +1078,15 @@ class BoundedUpdateQueueTests(unittest.TestCase):
                 return "sent"
 
         bot = FakeBot()
+        metrics = {}
         with patch("main.asyncio.sleep", new_callable=unittest.mock.AsyncMock) as sleep:
-            result = await _send_audio_limited(bot, chat_id=123, audio="cached-file-id")
+            result = await _send_audio_limited(
+                bot, metrics=metrics, chat_id=123, audio="cached-file-id"
+            )
 
         self.assertEqual(result, "sent")
         self.assertEqual(bot.calls, 2)
+        self.assertEqual(metrics["_runtime_metrics"]["telegram_retry_after"], 1)
         sleep.assert_awaited_once_with(0.51)
 
 
@@ -1142,7 +1150,10 @@ class RuntimeMetricsTests(unittest.IsolatedAsyncioTestCase):
             await log_runtime_metrics(ctx)
 
         log_info.assert_called_once()
-        message = log_info.call_args.args[0]
-        self.assertIn("queue=7/128", message)
-        self.assertIn("cache_hit(search=75.0%", message)
+        args = log_info.call_args.args
+        message = args[0]
+        self.assertIn("RUNTIME_METRICS queue=%d/%d", message)
+        self.assertEqual(args[1:3], (7, 128))
+        self.assertIn("cache_hit(search=%.1f%%", message)
+        self.assertEqual(args[7], 75.0)
         self.assertIn("rss_peak_mb=%.1f", message)
