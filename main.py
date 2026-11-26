@@ -2105,7 +2105,7 @@ def main():
             log_runtime_metrics, interval=60, first=60, name="runtime-metrics"
         )
     log.info("yt-dlp %s, стратегий: %d, PO-provider: %s",
-             yt_dlp.version.__version__, len(STRATEGIES), POT_PROVIDER_URL or "нет")
+             yt_dlp.version.__version__, len(STRATEGIES), "настроен" if POT_PROVIDER_URL else "нет")
     log.info(
         "Лимиты: updates=%d pending_updates=%d search=%d downloads=%d sends=%d video=%d",
         MAX_CONCURRENT_UPDATES, MAX_PENDING_UPDATES, MAX_PARALLEL_SEARCH,
